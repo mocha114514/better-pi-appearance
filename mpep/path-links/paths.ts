@@ -159,13 +159,27 @@ function pathSeparatorCount(token: string): number {
 	return (token.match(/[\\/]/g) ?? []).length;
 }
 
-/** Latin letters count as an English word; CJK-only chains stay expanded. */
-function hasEnglishWord(token: string): boolean {
-	return /[A-Za-z]/.test(token);
+/**
+ * English-only collapse rule, judged on the literal token text only:
+ * every character must be printable ASCII (A-Z, a-z, digits, English
+ * symbols). Any CJK ideograph or full-width punctuation (，、（）～「」 etc.)
+ * — as well as any non-Latin script — keeps the token expanded as plain
+ * text. Decoded content is irrelevant: a percent-encoded URL stays
+ * collapsible even if its short label renders as CJK.
+ */
+function isEnglishText(text: string): boolean {
+	for (let index = 0; index < text.length; index++) {
+		const code = text.charCodeAt(index);
+		if (code < 0x20 || code > 0x7e) return false;
+	}
+	return true;
 }
 
 export function looksLikePathToken(token: string): boolean {
 	if (token.length < 3) return false;
+	// Hard gate before anything else: mixed chains like `项目/src/文件` no
+	// longer collapse, even though they carry English letters.
+	if (!isEnglishText(token)) return false;
 	if (DATE_TOKEN.test(token)) return false;
 	if (/^(?:https?:|mailto:|file:|ftp:)/i.test(token) || /^www\./i.test(token)) return true;
 	const shaped =
@@ -177,7 +191,6 @@ export function looksLikePathToken(token: string): boolean {
 	if (!shaped) return false;
 	// One `/` or `\` is not a path: `/reload`, `foo/bar.ts`, `C:\a` stay plain text.
 	if (pathSeparatorCount(token) < 2) return false;
-	if (!hasEnglishWord(token)) return false;
 	return true;
 }
 
@@ -219,10 +232,16 @@ export function findCollapsibleTokens(
 		const kind = tokenKind(text);
 		const token = { start: index, end, text, kind };
 		const image = kind === "file" && isAbsoluteImagePath(text);
-		const allowed = mode === "absolute-images" ? image : looksLikePathToken(text);
+		const display = displayForToken(token);
+		// Literal-only rule: the gate is the token text, never the decoded display
+		// name. Percent-encoded URLs are ASCII on their face, so they still
+		// collapse even though the short label renders as CJK. `all` mode already
+		// enforces this inside looksLikePathToken; image chips need it explicitly.
+		const allowed =
+			mode === "absolute-images" ? image && isEnglishText(text) : looksLikePathToken(text);
 		const bounded =
 			edges || (isTokenBoundary(line[index - 1], image) && isTokenBoundary(line[end], image));
-		if (allowed && bounded && displayForToken(token) !== text && !overlaps(index, end, blocked)) {
+		if (allowed && bounded && display !== text && !overlaps(index, end, blocked)) {
 			tokens.push(token);
 		}
 		index = end;
