@@ -24,7 +24,11 @@ export function createProcessFoldHeader(process: ProcessFoldState): Component {
 			render(width) {
 				const theme = getLatestTheme();
 				const label = `${process.expanded ? "\u25bc" : "\u25b6"} ${t("activity.cookingProcess")}`;
-				return [truncateToWidth(theme.fg("toolTitle", theme.bold(label)), Math.max(1, width), "")];
+				// Only the compaction-kept tail carries a tag; ordinary runs stay a bare label.
+				const tag = process.fold?.retained === true
+					? theme.fg("muted", ` \u2022 ${t("activity.retainedTail")}${t("activity.expandHint")}`)
+					: "";
+				return [truncateToWidth(theme.fg("toolTitle", theme.bold(label)) + tag, Math.max(1, width), "")];
 			},
 			invalidate() {},
 		},

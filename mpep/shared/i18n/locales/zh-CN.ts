@@ -121,6 +121,7 @@ export const zhCN = {
   "activity.tokens": "{count} tokens",
   "activity.compacted": "**从 {count} tokens 压缩**\n\n",
   "activity.cookingProcess": "Cooking process",
+  "activity.retainedTail": "压缩保留的原文",
   "timer.cooking": "Cooking",
   "timer.cooked": "cooked for {elapsed}",
   "scroll.unsupported": "全屏滚动：当前 Pi 版本未提供 wheelScrollLines。",

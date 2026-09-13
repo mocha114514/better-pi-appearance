@@ -42,6 +42,25 @@ interface RenderHost {
 	renderSessionEntries(entries: SessionEntry[], options?: unknown): void;
 }
 
+/** Session surface needed to mirror the entry list Pi paints. */
+export interface ContextSession {
+	buildContextEntries(): SessionEntry[];
+	getBranch(): readonly PlacementEntry[];
+}
+
+/**
+ * Entries in the order Pi renders them, which is also the list fold state must follow.
+ *
+ * Pi prepends the latest compaction in buildContextEntries() and omits summarized history.
+ * Folding from that list as-is anchors a kept tail's process on messages that are not on
+ * screen, so the disclosure header never paints and the whole kept tail collapses to zero
+ * visible lines. Ordering the list through the cut keeps every fold anchor on a rendered
+ * message; on sessions without compactions this is exactly buildContextEntries().
+ */
+export function orderedSessionEntries(session: ContextSession): SessionEntry[] {
+	return placeCompactionAtCut(session.buildContextEntries(), session.getBranch()) as SessionEntry[];
+}
+
 export function installCompactionPlacement(): () => void {
 	patches[patchSlot]?.();
 	const proto = InteractiveMode.prototype as unknown as RenderHost;

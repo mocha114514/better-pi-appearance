@@ -120,6 +120,7 @@ export const en = {
   "activity.tokens": "{count} tokens",
   "activity.compacted": "**Compacted from {count} tokens**\n\n",
   "activity.cookingProcess": "Cooking process",
+  "activity.retainedTail": "kept by compaction",
   "timer.cooking": "Cooking",
   "timer.cooked": "cooked for {elapsed}",
   "scroll.unsupported": "Fullscreen scroll: this Pi version does not expose wheelScrollLines.",

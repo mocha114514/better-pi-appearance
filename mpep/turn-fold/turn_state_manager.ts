@@ -211,7 +211,12 @@ export function syncFromSessionHistory(
 ): void {
 	resetTurnState();
 	for (const entry of entries) {
-		if (entry.type === "compaction" || entry.type === "branch_summary" || entry.type === "custom_message") {
+		if (entry.type === "compaction") {
+			sealActiveGroup();
+			// The process sealed by a compaction boundary is the tail Pi kept verbatim for
+			// the model context, so its disclosure gets the "kept" tag.
+			completeProcessFolds({ retained: true });
+		} else if (entry.type === "branch_summary" || entry.type === "custom_message") {
 			sealActiveGroup();
 			completeProcessFolds();
 		}

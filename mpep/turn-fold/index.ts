@@ -1,6 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { isPluginEnabled } from "../manager/preferences.ts";
 import { registerBuiltInTools } from "./builtin_tools_override.ts";
+import { orderedSessionEntries } from "./compaction_placement.ts";
 import { completeProcessFolds } from "./process_fold_state.ts";
 import { applyPatches } from "./core_components_patcher.ts";
 import { setupMcpCoordinator } from "./mcp_tools_coordinator.ts";
@@ -28,7 +29,8 @@ export default function (pi: ExtensionAPI): void {
 	const restoreSession = (_event: unknown, ctx: ExtensionContext) => {
 		resetMouseTiming();
 		setLatestTheme(ctx.ui.theme);
-		syncFromSessionHistory(ctx.sessionManager.getBranch(), !ctx.isIdle());
+		// Fold state must mirror what Pi paints, not the raw branch: see orderedSessionEntries.
+		syncFromSessionHistory(orderedSessionEntries(ctx.sessionManager), !ctx.isIdle());
 	};
 	pi.on("session_start", restoreSession);
 	pi.on("session_compact", restoreSession);
