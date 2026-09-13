@@ -3,6 +3,7 @@
 
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { Editor, hyperlink } from "@earendil-works/pi-tui";
+import { type EditorVisualLineMap, setEditorVisualMapProvider } from "../shared/editor-visual-map.ts";
 import {
 	collapseLineVisual,
 	encodePathHref,
@@ -24,15 +25,9 @@ interface EditorInternals {
 	state: EditorState;
 }
 
-interface LineMap {
-	visual: string;
-	toLogical: number[];
-	toVisual: number[];
-}
-
 interface VisualFrame {
 	saved: EditorState;
-	maps: LineMap[];
+	maps: EditorVisualLineMap[];
 }
 
 const patchSlot = Symbol.for("mpep.path-links.editor");
@@ -46,7 +41,7 @@ function snapshot(state: EditorState): EditorState {
 
 const EDITOR_MODE = "absolute-images" as const;
 
-function mapsFor(state: EditorState): LineMap[] {
+function mapsFor(state: EditorState): EditorVisualLineMap[] {
 	return state.lines.map((line, index) =>
 		collapseLineVisual(line, index === state.cursorLine ? state.cursorCol : undefined, EDITOR_MODE),
 	);
@@ -107,6 +102,11 @@ function chipsFor(state: EditorState): Array<{ display: string; href: string }> 
 export function installEditorPathChips(theme: () => PathTheme): () => void {
 	patches[patchSlot]?.();
 	themeFor = theme;
+	// Publish the maps of the frame that is currently on screen, so other plugins can translate screen
+	// cells back into buffer positions (see mpep/shared/editor-visual-map.ts).
+	const disposeVisualMap = setEditorVisualMapProvider((editor) =>
+		editor instanceof Editor ? frames.get(editor)?.maps : undefined,
+	);
 	const proto = Editor.prototype as unknown as {
 		layoutText: (width: number) => unknown;
 		handleMouse: (event: unknown) => unknown;
@@ -155,6 +155,7 @@ export function installEditorPathChips(theme: () => PathTheme): () => void {
 		proto.layoutText = originalLayoutText;
 		proto.handleMouse = originalHandleMouse;
 		proto.render = originalRender;
+		disposeVisualMap();
 		themeFor = undefined;
 		if (patches[patchSlot] === dispose) delete patches[patchSlot];
 	};

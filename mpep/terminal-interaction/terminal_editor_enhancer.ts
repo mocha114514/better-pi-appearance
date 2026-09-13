@@ -1,4 +1,5 @@
 import { t } from "../shared/i18n/index.ts";
+import { type EditorVisualLineMap, getEditorVisualLineMaps } from "../shared/editor-visual-map.ts";
 import { CustomEditor, copyToClipboard, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { matchesKey, type TuiAltScreen, visibleWidth } from "@earendil-works/pi-tui";
 import { installCursorMarkerGuard } from "./cursor-marker-guard.ts";
@@ -154,27 +155,24 @@ export class StylizedDesignEditor extends CustomEditor {
 
 		const scrollOffset = (this as any).scrollOffset ?? 0;
 		const visualLineIndex = scrollOffset + clampedY - 1;
-		const visualLines =
-			typeof (this as any).buildVisualLineMap === "function"
-				? (this as any).buildVisualLineMap((this as any).lastWidth ?? 80)
-				: null;
 
-		if (!visualLines || !visualLines[visualLineIndex]) return null;
-
-		const visualLine = visualLines[visualLineIndex];
-		const lines: string[] = (this as any).state?.lines ?? [];
-		const logicalLine = lines[visualLine.logicalLine] ?? "";
-		const chunkEnd = visualLine.startCol + visualLine.length;
-		const chunk = logicalLine.slice(visualLine.startCol, chunkEnd);
+		// The rows on screen show the *reshaped* text when a plugin collapses part of the buffer for display
+		// (path-links turns absolute image paths into chips), so the layout has to be computed from that same
+		// text and the hit column has to be translated back through the collapse table. Using the logical
+		// lines instead shifts the row (different wrap points) and the column (collapsed characters), which
+		// made every copied or cut selection resolve to a neighbouring buffer range.
+		const maps = getEditorVisualLineMaps(this);
+		const row = this.layOutRowAt(visualLineIndex, maps);
+		if (!row) return null;
 
 		const paddingX = (this as any).paddingX ?? 0;
 		const targetColumn = Math.max(0, relX - paddingX);
 
 		let visibleColumn = 0;
-		let targetIndex = chunk.length;
+		let targetIndex = row.text.length;
 
 		if (typeof (this as any).segment === "function") {
-			for (const grapheme of (this as any).segment(chunk, "grapheme")) {
+			for (const grapheme of (this as any).segment(row.text, "grapheme")) {
 				const nextColumn = visibleColumn + visibleWidth(grapheme.segment);
 				if (targetColumn < nextColumn) {
 					// Key point: JavaScript's string.slice(start, end) uses a half-open interval [start, end).
@@ -185,13 +183,51 @@ export class StylizedDesignEditor extends CustomEditor {
 				visibleColumn = nextColumn;
 			}
 		} else {
-			targetIndex = Math.min(targetColumn, chunk.length);
+			targetIndex = Math.min(targetColumn, row.text.length);
 		}
 
+		const visualCol = row.startCol + targetIndex;
+		const map = maps?.[row.line];
+		// `toLogical` covers every visual offset plus the line end, so the clamped lookup always resolves.
+		const col = map
+			? (map.toLogical[Math.max(0, Math.min(visualCol, map.toLogical.length - 1))] ?? visualCol)
+			: visualCol;
+
 		return {
-			line: visualLine.logicalLine,
-			col: visualLine.startCol + targetIndex,
+			line: row.line,
+			col,
 		};
+	}
+
+	/**
+	 * Resolve a rendered row index into its buffer line plus the text chunk drawn on that row.
+	 *
+	 * When a plugin reshapes the buffer for display, the editor's own wrapping helper has to see the
+	 * reshaped lines during the call, because it wraps `state.lines` directly. The temporary swap mirrors
+	 * what path-links/editor.ts does around `Editor.handleMouse`.
+	 */
+	private layOutRowAt(
+		rowIndex: number,
+		maps: readonly EditorVisualLineMap[] | undefined,
+	): { line: number; startCol: number; text: string } | null {
+		const internals = this as any;
+		if (typeof internals.buildVisualLineMap !== "function") return null;
+
+		const logicalLines: string[] = internals.state?.lines ?? [];
+		const visualLines = maps?.map((map) => map.visual);
+		const sourceLines = visualLines ?? logicalLines;
+
+		let row: { logicalLine: number; startCol: number; length: number } | undefined;
+		try {
+			if (visualLines) internals.state.lines = visualLines;
+			row = internals.buildVisualLineMap(internals.lastWidth ?? 80)[rowIndex];
+		} finally {
+			if (visualLines) internals.state.lines = logicalLines;
+		}
+		if (!row) return null;
+
+		const line = sourceLines[row.logicalLine] ?? "";
+		return { line: row.logicalLine, startCol: row.startCol, text: line.slice(row.startCol, row.startCol + row.length) };
 	}
 
 	/**
