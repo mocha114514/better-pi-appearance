@@ -1,6 +1,9 @@
 // Path / URL detection, markdown rewriting, and OSC 8 copy expansion.
 // Tokens are split on whitespace and backticks.
 // Complete paths use file:// so the terminal can open them; relative paths keep mpep-path:.
+// Bare URLs glued to CJK prose are repaired before marked parses the line
+// (separateAutolinkTails): Pi's GFM autolink keeps everything up to the next
+// whitespace, so the Chinese would otherwise land inside the link href.
 
 import { homedir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -167,10 +170,15 @@ function pathSeparatorCount(token: string): number {
  * text. Decoded content is irrelevant: a percent-encoded URL stays
  * collapsible even if its short label renders as CJK.
  */
+/** Printable ASCII: A-Z, a-z, digits, English symbols, spaces. */
+function isPrintableAscii(char: string): boolean {
+	const code = char.charCodeAt(0);
+	return code >= 0x20 && code <= 0x7e;
+}
+
 function isEnglishText(text: string): boolean {
-	for (let index = 0; index < text.length; index++) {
-		const code = text.charCodeAt(index);
-		if (code < 0x20 || code > 0x7e) return false;
+	for (const char of text) {
+		if (!isPrintableAscii(char)) return false;
 	}
 	return true;
 }
@@ -315,6 +323,109 @@ function splitInline(line: string): Array<{ start: number; end: number; kind: "c
 	return segments;
 }
 
+// ---------------------------------------------------------------------------
+// Bare-URL autolink boundary repair (URL glued to CJK prose)
+// ---------------------------------------------------------------------------
+// Pi renders markdown with marked's GFM autolink rule
+// (`((?:https?|ftp)://|www\.)(?:[a-zA-Z0-9-]+\.?)+[^\s<]*`): everything up to the
+// next whitespace or `<` becomes the href, and its backpedal only strips
+// trailing ASCII punctuation — never CJK. So `…/observation.html"这里的 port
+// 要填具体值吗？` becomes ONE link whose text and href both carry the Chinese
+// (clicking it opens a percent-encoded nonsense URL).
+//
+// path-links cannot undo that downstream: its English-only gate only decides
+// whether a token is rewritten into a short markdown link, and this token fails
+// the gate (contains CJK) so it stays expanded — yet marked links it anyway.
+// The boundary is therefore repaired here, before marked parses the line, by
+// making the URL boundary explicit: a scheme URL is wrapped in an `<…>`
+// autolink and the glued tail stays plain text. Nothing is touched unless a
+// non-ASCII character is actually glued to a URL, so pure-ASCII lines
+// round-trip byte-identical and percent-encoded URLs stay untouched.
+//
+// The repair runs *after* the collapse (see transformPathMarkdown): the collapse
+// already refused this CJK token, so the token keeps the gate's "stays
+// expanded" outcome instead of gaining a fresh short chip from the repair.
+
+/** Bare-URL starts recognised by marked's GFM autolink (`protocol` alternation). */
+const AUTOLINK_START = /(?:https?:\/\/|ftp:\/\/|www\.)/gi;
+
+/**
+ * Marked's host requirement after the start, reused as a guard: a URL whose own
+ * host is non-ASCII (`http://例.com`) is left alone instead of being cut into a
+ * broken `<http://>` autolink.
+ */
+const AUTOLINK_HOST = /^(?:https?|ftp):\/\/(?:[a-zA-Z0-9-]+\.?)+|^www\.(?:[a-zA-Z0-9-]+\.?)+/;
+
+/** Quote characters that prose glues onto a URL but that never end one. */
+function isUrlTailQuote(char: string | undefined): boolean {
+	return char === '"' || char === "'";
+}
+
+/** Marked's autolink run: `[^\s<]*` after the start, i.e. up to a space or `<`. */
+function autolinkRunEnd(line: string, start: number): number {
+	let end = start;
+	while (end < line.length) {
+		const char = line[end] ?? "";
+		if (char === "<" || /\s/.test(char)) break;
+		end++;
+	}
+	return end;
+}
+
+/** Offset of the first non-ASCII character inside [start, end), or -1. */
+function firstNonAsciiOffset(line: string, start: number, end: number): number {
+	for (let index = start; index < end; index++) {
+		if (!isPrintableAscii(line[index] ?? "")) return index;
+	}
+	return -1;
+}
+
+function applyLineEdits(line: string, edits: Array<{ start: number; end: number; text: string }>): string {
+	if (edits.length === 0) return line;
+	let out = "";
+	let cursor = 0;
+	for (const edit of [...edits].sort((a, b) => a.start - b.start)) {
+		// Overlapping candidates (a URL inside a URL's tail) keep the leftmost one.
+		if (edit.start < cursor) continue;
+		out += line.slice(cursor, edit.start) + edit.text;
+		cursor = edit.end;
+	}
+	return out + line.slice(cursor);
+}
+
+/**
+ * Cut a bare URL away from CJK prose glued onto it so marked keeps it a single
+ * valid link. Line content inside inline code spans and markdown links is left
+ * untouched, as are lines without any glued non-ASCII tail.
+ */
+export function separateAutolinkTails(line: string): string {
+	if (!line || (!line.includes("://") && !/www\./i.test(line))) return line;
+	const blocked = allMatches(line, MD_LINK).map((match) => ({
+		start: match.index ?? 0,
+		end: (match.index ?? 0) + match[0].length,
+	}));
+	const edits: Array<{ start: number; end: number; text: string }> = [];
+	for (const segment of splitInline(line)) {
+		if (segment.kind === "code") continue;
+		for (const match of segment.raw.matchAll(AUTOLINK_START)) {
+			const start = segment.start + (match.index ?? 0);
+			const end = autolinkRunEnd(line, start);
+			// `<-url>` is already an explicit autolink; md links own their destination.
+			if (line[start - 1] === "<" || overlaps(start, end, blocked)) continue;
+			const tail = firstNonAsciiOffset(line, start, end);
+			if (tail < 0) continue;
+			let urlEnd = tail;
+			while (urlEnd > start && isUrlTailQuote(line[urlEnd - 1])) urlEnd--;
+			const url = line.slice(start, urlEnd);
+			if (!AUTOLINK_HOST.test(url)) continue;
+			// `www.` has no scheme to wrap; a space is enough for marked to stop there.
+			const prefix = /^www\./i.test(url) ? `${url} ` : `<${url}>`;
+			edits.push({ start, end: tail, text: prefix + line.slice(urlEnd, tail) });
+		}
+	}
+	return applyLineEdits(line, edits);
+}
+
 function transformLine(line: string): string {
 	if (!line) return line;
 	let out = "";
@@ -365,7 +476,7 @@ export function transformPathMarkdown(markdown: string): string {
 			transformed.push(line);
 			continue;
 		}
-		transformed.push(inFence ? line : transformLine(line));
+		transformed.push(inFence ? line : separateAutolinkTails(transformLine(line)));
 	}
 	return transformed.join("\n");
 }
