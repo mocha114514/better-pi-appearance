@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="{{LANG}}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>{{TITLE}}</title>
+<style>{{CSS}}</style>
+</head>
+<body>
+<aside id="toc" aria-label="{{TOC_TITLE}}">
+	<div class="toc-head">{{TOC_TITLE}}</div>
+	<ol id="toc-list">{{TOC}}</ol>
+</aside>
+<main>
+	<header class="bar">
+		<button type="button" data-act="expand">{{EXPAND_ALL}}</button>
+		<button type="button" data-act="collapse">{{COLLAPSE_ALL}}</button>
+		<input id="q" type="search" placeholder="{{SEARCH}}" autocomplete="off" spellcheck="false">
+		<span id="matches" class="matches"></span>
+		<span class="stats">{{STATS}}</span>
+	</header>
+	<div id="transcript">{{BODY}}</div>
+	<footer class="foot">{{KBD}}</footer>
+</main>
+<script>{{MD_LIB}}</script>
+<script>{{HLJS_LIB}}</script>
+<script>window.MPEP = {{LABELS}};</script>
+<script>{{JS}}</script>
+</body>
+</html>

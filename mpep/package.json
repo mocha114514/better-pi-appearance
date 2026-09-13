@@ -24,7 +24,8 @@
       "./statusline.ts",
       "./tps.ts",
       "./theme-distributor.ts",
-      "./usage/index.ts"
+      "./usage/index.ts",
+      "./export/index.ts"
     ]
   }
 }

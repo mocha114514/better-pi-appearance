@@ -68,5 +68,12 @@
     "path": "./usage/index.ts",
     "desc": "实时记录用量与费用，按天汇总账单，支持后台统计与临时账本清理",
     "enabled": true
+  },
+  {
+    "id": "export",
+    "name": "会话导出 (/m-export)",
+    "path": "./export/index.ts",
+    "desc": "把当前会话导出为单文件交互式 HTML：沿用终端折叠风格，含压缩前历史、目录与搜索",
+    "enabled": true
   }
 ]

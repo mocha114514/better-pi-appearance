@@ -1,0 +1,246 @@
+/* Transcript page for /m-export. Palette comes from the active Pi theme (see render.ts). */
+:root {
+	/* The semicolon belongs to this stylesheet, not to the generator: without it the last theme
+	   variable swallows the declarations below (the font stack), and the page silently drops
+	   back to the browser default font. Keeping it here means a fixed stylesheet works even
+	   when an older renderer is still loaded in the running Pi process. */
+	{{THEME_VARS}};
+	/* Terminal font first: ui-monospace resolves to the browser's own choice, not the terminal's.
+	   Cascadia Mono has no Han glyphs, so Chinese falls through to Noto Sans SC.
+	   The CJK family stays behind every monospace candidate on purpose: it also carries Latin
+	   glyphs, and pulling it forward would make ASCII proportional wherever Cascadia is absent. */
+	--mono: "Cascadia Mono", "Cascadia Code", ui-monospace, "JetBrains Mono", Consolas, "Courier New", "Noto Sans SC", monospace;
+	--pad: 10px;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+	margin: 0;
+	padding: 0;
+	background: var(--bg);
+	color: var(--fg);
+	font-family: var(--mono);
+	font-size: 13px;
+	line-height: 1.55;
+}
+
+body { padding-left: 264px; }
+
+/* ── left pane: conversation index ─────────────────────────────────────────── */
+#toc {
+	position: fixed;
+	inset: 0 auto 0 0;
+	width: 264px;
+	overflow-y: auto;
+	border-right: 1px solid var(--rule);
+	background: var(--card);
+	padding: 10px 8px 32px;
+}
+
+.toc-head {
+	color: var(--muted);
+	text-transform: lowercase;
+	letter-spacing: 0.05em;
+	padding: 2px 6px 8px;
+}
+
+#toc-list { list-style: none; margin: 0; padding: 0; }
+
+#toc-list a {
+	display: grid;
+	grid-template-columns: 22px 1fr;
+	gap: 2px 6px;
+	padding: 5px 6px;
+	color: var(--fg);
+	text-decoration: none;
+	border-left: 2px solid transparent;
+	border-radius: 3px;
+}
+
+#toc-list a:hover { background: var(--hover); }
+#toc-list a.active { border-left-color: var(--accent); background: var(--hover); }
+#toc-list .i { color: var(--muted); }
+#toc-list .t { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#toc-list .time { grid-column: 2; color: var(--dim); font-size: 11px; }
+
+/* ── top bar ──────────────────────────────────────────────────────────────── */
+main { max-width: 1080px; margin: 0 auto; padding: 0 16px 48px; }
+
+.bar {
+	position: sticky;
+	top: 0;
+	z-index: 5;
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	flex-wrap: wrap;
+	margin: 0 -16px 14px;
+	padding: 10px 16px;
+	background: var(--bg);
+	border-bottom: 1px solid var(--rule);
+}
+
+.bar button {
+	font-family: inherit;
+	font-size: 12px;
+	color: var(--fg);
+	background: var(--card);
+	border: 1px solid var(--rule);
+	border-radius: 4px;
+	padding: 4px 10px;
+	cursor: pointer;
+}
+
+.bar button:hover { border-color: var(--accent); color: var(--accent); }
+
+.bar input {
+	font-family: inherit;
+	font-size: 12px;
+	color: var(--fg);
+	background: var(--card);
+	border: 1px solid var(--rule);
+	border-radius: 4px;
+	padding: 5px 8px;
+	width: 220px;
+}
+
+.bar input:focus { outline: none; border-color: var(--accent); }
+.matches { color: var(--muted); font-size: 12px; }
+.stats { margin-left: auto; color: var(--muted); font-size: 12px; }
+
+/* ── transcript blocks ────────────────────────────────────────────────────── */
+.block { margin: 0 0 6px; }
+.block[hidden] { display: none; }
+
+.user {
+	background: var(--user-bg);
+	border-left: 2px solid var(--accent);
+	border-radius: 4px;
+	padding: var(--pad) 12px;
+	margin: 14px 0 8px;
+}
+
+.meta { display: flex; gap: 8px; align-items: baseline; color: var(--dim); font-size: 11px; margin-bottom: 4px; }
+.meta .who { color: var(--accent); }
+
+.head {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	width: 100%;
+	font-family: inherit;
+	font-size: 13px;
+	color: var(--fg);
+	background: none;
+	border: 0;
+	border-radius: 3px;
+	padding: 2px 4px;
+	text-align: left;
+	cursor: pointer;
+	overflow: hidden;
+}
+
+.head:hover { background: var(--hover); }
+.head .caret::before { content: "\25B6"; color: var(--muted); }
+[data-fold][data-open="1"] > .head .caret::before { content: "\25BC"; }
+.head .label { color: var(--title); font-weight: 600; white-space: nowrap; }
+.head .counts { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.head .tag { color: var(--warn); white-space: nowrap; }
+.head .hint { margin-left: auto; color: var(--dim); font-size: 11px; white-space: nowrap; }
+
+[data-fold] > .head .hint-close { display: none; }
+[data-fold][data-open="1"] > .head .hint-close { display: inline; }
+[data-fold][data-open="1"] > .head .hint-open { display: none; }
+
+[data-fold] > .body { display: none; }
+[data-fold][data-open="1"] > .body { display: block; }
+
+.run > .body { margin: 4px 0 0 14px; padding-left: 10px; border-left: 1px solid var(--rule); }
+
+.item { margin: 2px 0; }
+.item .head .tool-name { color: var(--title); }
+.item .head .preview { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.item .body { margin: 2px 0 8px 14px; padding-left: 10px; border-left: 1px solid var(--rule); }
+.item[data-error="1"] .head .tool-name { color: var(--err); }
+.item[data-pending="1"] .head .tool-name { color: var(--muted); }
+
+.label { color: var(--dim); font-size: 11px; margin: 6px 0 2px; text-transform: lowercase; }
+
+pre {
+	margin: 0;
+	padding: 8px 10px;
+	background: var(--card);
+	border: 1px solid var(--rule);
+	border-radius: 4px;
+	overflow-x: auto;
+	white-space: pre-wrap;
+	word-break: break-word;
+	font-family: inherit;
+	font-size: 12px;
+	position: relative;
+}
+
+pre.out { max-height: 420px; overflow-y: auto; }
+pre.copied { border-color: var(--ok); }
+
+pre .copy {
+	position: absolute;
+	top: 4px;
+	right: 4px;
+	font-family: inherit;
+	font-size: 10px;
+	color: var(--muted);
+	background: var(--bg);
+	border: 1px solid var(--rule);
+	border-radius: 3px;
+	padding: 1px 5px;
+	cursor: pointer;
+	opacity: 0;
+	transition: opacity 0.12s;
+}
+
+pre:hover .copy { opacity: 1; }
+pre .copy:hover { color: var(--accent); border-color: var(--accent); }
+
+.tail { margin-top: 4px; }
+
+.rule { border-top: 1px solid var(--rule); margin: 8px 0; }
+
+.notice {
+	color: var(--err);
+	border-left: 2px solid var(--err);
+	padding: 2px 8px;
+	margin: 6px 0;
+}
+
+.compaction, .custom, .summary { margin: 12px 0; }
+.compaction > .head .label, .summary > .head .label { color: var(--warn); }
+.compaction > .body, .summary > .body, .custom > .body { margin: 4px 0 0 14px; padding-left: 10px; border-left: 1px solid var(--rule); }
+
+/* ── markdown ─────────────────────────────────────────────────────────────── */
+.md > :first-child { margin-top: 0; }
+.md > :last-child { margin-bottom: 0; }
+.md h1, .md h2, .md h3, .md h4 { color: var(--heading); margin: 12px 0 6px; font-size: 1.05em; }
+.md p { margin: 6px 0; }
+.md ul, .md ol { margin: 6px 0; padding-left: 22px; }
+.md li { margin: 2px 0; }
+.md a { color: var(--accent); }
+/* Inline code must inherit the terminal font: the browser's default monospace is a different
+   (often serif) face, which makes paths and identifiers look nothing like the terminal. */
+.md code { font-family: inherit; color: var(--accent); background: var(--card); padding: 0 4px; border-radius: 3px; }
+.md pre code { color: var(--fg); background: none; padding: 0; }
+.md blockquote { margin: 6px 0; padding: 2px 10px; border-left: 2px solid var(--rule); color: var(--muted); }
+.md table { border-collapse: collapse; margin: 8px 0; }
+.md th, .md td { border: 1px solid var(--rule); padding: 3px 8px; }
+.md hr { border: 0; border-top: 1px solid var(--rule); margin: 10px 0; }
+.md img { max-width: 100%; }
+
+mark { background: var(--mark-bg); color: var(--mark-fg); border-radius: 2px; }
+
+.foot { color: var(--dim); font-size: 11px; margin-top: 24px; }
+
+@media (max-width: 900px) {
+	body { padding-left: 0; }
+	#toc { display: none; }
+}
