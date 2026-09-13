@@ -1,6 +1,7 @@
 import { t } from "../shared/i18n/index.ts";
 import { CustomEditor, copyToClipboard, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { matchesKey, type TuiAltScreen, visibleWidth } from "@earendil-works/pi-tui";
+import { installCursorMarkerGuard } from "./cursor-marker-guard.ts";
 
 interface EditorRange {
 	startLine: number;
@@ -416,6 +417,9 @@ export function setupEditorEnhancements(pi: ExtensionAPI): () => void {
 	};
 	process.on("exit", restoreCursor);
 
+	// StylizedDesignEditor removes the inverse-video cursor block, which is what normally keeps a
+	// duplicated CURSOR_MARKER harmless: see cursor-marker-guard.ts for the full explanation.
+	const disposeCursorMarkerGuard = installCursorMarkerGuard();
 	pi.on("session_start", (_event, ctx) => {
 		ctx.ui.setEditorComponent(
 			(tui, theme, kb) => new StylizedDesignEditor(tui, theme, kb, { embedWorkingStatus: true }),
@@ -423,5 +427,6 @@ export function setupEditorEnhancements(pi: ExtensionAPI): () => void {
 	});
 	return () => {
 		process.off("exit", restoreCursor);
+		disposeCursorMarkerGuard();
 	};
 }
