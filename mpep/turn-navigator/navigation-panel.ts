@@ -39,7 +39,7 @@ export class NavigationPanel implements Component {
 		this.anchors = anchors;
 		this.active = active;
 		this.height = Math.max(0, height);
-		this.band = navigationBand(this.height);
+		this.band = navigationBand(this.height, anchors.length);
 		const capacity = Math.max(0, this.band.height - 2);
 		if (recenter) this.start = Math.max(0, Math.min(active - Math.floor(capacity / 2), anchors.length - capacity));
 		this.markers = markerRows(anchors.length, this.band.height, this.start);

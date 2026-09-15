@@ -7,10 +7,30 @@ export interface TurnAnchor {
 /** Columns occupied by the right-side turn rail. Matches the single-cell ─ / ═ markers. */
 export const NAVIGATOR_COLUMNS = 1;
 
-export function navigationBand(viewportHeight: number): { top: number; height: number } {
+/**
+ * Rows a complete marker list needs: one line per turn plus the top/bottom arrows.
+ * Zero markers means "no lower bound" so an empty index keeps the default band.
+ */
+function bandRows(count: number): number {
+	return count > 0 ? count + 2 : 0;
+}
+
+/**
+ * Vertical slice of the transcript viewport occupied by the rail.
+ *
+ * Few turns: the middle-lower half of the viewport, unchanged. From the point where
+ * every marker already has its own line, the band grows one row per extra turn so the
+ * markers stay individually clickable, up to the whole viewport height; only past that
+ * limit does markerRows() window the list and the wheel take over.
+ */
+export function navigationBand(viewportHeight: number, markerCount = 0): { top: number; height: number } {
 	const available = Math.max(0, Math.floor(viewportHeight));
-	const height = Math.min(available, Math.max(3, Math.round(available * 0.5)));
-	return { top: Math.min(Math.floor(available * 0.3), available - height), height };
+	const base = Math.min(available, Math.max(3, Math.round(available * 0.5)));
+	const height = Math.max(base, Math.min(available, bandRows(markerCount)));
+	// Grow around the default band's centre so the rail stretches symmetrically towards
+	// both edges and covers the whole viewport once the growth is complete.
+	const center = base / 2 + Math.min(Math.floor(available * 0.3), available - base);
+	return { top: Math.round(Math.max(0, Math.min(center - height / 2, available - height))), height };
 }
 
 /**

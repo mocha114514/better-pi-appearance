@@ -187,12 +187,13 @@ class ViewportAttachment {
 			this.hidePreview();
 			return;
 		}
-		const band = navigationBand(panelBox.clip.height);
-		this.panelRect = { ...panelBox.clip, y: panelBox.clip.y + band.top, height: band.height };
+		// Anchors first: the band height depends on how many markers must fit on one line each.
 		this.anchors = this.indexTurns(
 			this.scrollView.getContentWidth(scrollBox.rect.width),
 			scrollBox.scrollContentLines?.length ?? 0,
 		);
+		const band = navigationBand(panelBox.clip.height, this.anchors.length);
+		this.panelRect = { ...panelBox.clip, y: panelBox.clip.y + band.top, height: band.height };
 		let active = activeTurn(this.anchors, this.scrollView.scrollTop, this.scrollView.viewportHeight);
 		const maxTop = Math.max(0, (scrollBox.scrollContentLines?.length ?? 0) - this.scrollView.viewportHeight);
 		const selected = this.anchors.findIndex((anchor) => anchor.key === this.selectedKey);
