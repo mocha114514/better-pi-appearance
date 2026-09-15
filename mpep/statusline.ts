@@ -1,11 +1,19 @@
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import {
+	truncateToWidth,
+	visibleWidth,
+	type TuiMouseEvent,
+	type TuiMouseEventResult,
+} from "@earendil-works/pi-tui";
 import { t } from "./shared/i18n/index.ts";
 import { isPluginEnabled } from "./manager/preferences.ts";
-
-const execFileAsync = promisify(execFile);
+import {
+	formatGitStatus,
+	GitStatusTracker,
+	type GitStatusDisplay,
+	type GitStatusSnapshot,
+	type GitStatusToken,
+} from "./shared/git-status.ts";
 
 // ── ANSI Colors (high-contrast bright colors, consistent with statusline.py) ──
 const CYAN = "\x1b[96m"; // Model name and right-side info
@@ -15,11 +23,16 @@ const YELLOW = "\x1b[93m"; // Normal token display
 const LIGHT_PINK = "\x1b[38;2;255;182;193m"; // Git branch and status
 const GRAY = "\x1b[90m"; // Separator
 const ORANGE = "\x1b[38;5;214m"; // Context warning (>80%)
-const RED_BRIGHT = "\x1b[91m"; // Context danger (>95%)
+const RED_BRIGHT = "\x1b[91m"; // Context danger (>95%) and git merge conflicts
 const RESET = "\x1b[0m";
 
 const MODEL_WIDGET_KEY = "model-info";
+/** Repaint cadence for the token/context counters; independent of the git probe. */
 const REFRESH_INTERVAL_MS = 1000;
+/** How often the git area re-probes on its own. A round ending or a double click skips the wait. */
+const GIT_REFRESH_INTERVAL_MS = 10_000;
+/** How long the "refreshed" marker stays visible after an on-demand refresh. */
+const GIT_REFRESH_MARKER_MS = 1500;
 
 function formatTokens(count: number): string {
 	if (count < 1000) return count.toString();
@@ -48,55 +61,59 @@ function composeLeftRight(left: string, right: string, width: number): string {
 	return `${fittedLeft}${" ".repeat(pad)}${right}`;
 }
 
+/**
+ * Render the right-aligned git area: `branch ✓` when there is nothing to report, otherwise
+ * `branch ● <tokens>` with conflicts in the alert colour and an optional "refreshed" marker.
+ * Returns "" when there is no snapshot, which makes the whole area disappear.
+ */
+function buildGitText(
+	display: GitStatusDisplay | null,
+	extra: GitStatusToken[],
+	markerLabel: string | null,
+): string {
+	if (!display) return "";
+	const tokens = [...display.tokens, ...extra];
+	const body =
+		tokens.length === 0
+			? `${display.branch} ✓`
+			: `${display.branch} ● ${tokens
+					.map(token => (token.alarm ? `${RED_BRIGHT}${token.text}${LIGHT_PINK}` : token.text))
+					.join(" ")}`;
+	const marker = markerLabel === null ? "" : ` ${GRAY}${markerLabel}${RESET}`;
+	return `${LIGHT_PINK}${body}${RESET}${marker}`;
+}
+
+/**
+ * Upstream divergence, spelled out instead of drawn as arrows: `↑1↓1` read as "up one, down one"
+ * rather than "one commit to push, one to pull", so the wording comes from the locale table.
+ * These counters describe the last fetch, not the current state of the remote.
+ */
+function buildDivergenceTokens(snapshot: GitStatusSnapshot): GitStatusToken[] {
+	const tokens: GitStatusToken[] = [];
+	if (snapshot.ahead > 0) tokens.push({ text: t("status.gitAhead", { count: snapshot.ahead }), alarm: false });
+	if (snapshot.behind > 0) tokens.push({ text: t("status.gitBehind", { count: snapshot.behind }), alarm: false });
+	return tokens;
+}
+
 export default function (pi: ExtensionAPI) {
 	if (!isPluginEnabled("statusline")) return;
-	let cachedGitStatus: string | null = null;
-	let projectRoot: string = process.cwd();
-
-	// Asynchronously update detailed Git status (branch name + M/A/D/? counts)
-	async function updateGitStatus(cwd: string) {
-		try {
-			const { stdout: rootOut } = await execFileAsync("git", ["rev-parse", "--show-toplevel"], { cwd });
-			projectRoot = rootOut.trim() || cwd;
-
-			const { stdout: branchOut } = await execFileAsync("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd });
-			const branch = branchOut.trim();
-
-			const { stdout: porcelain } = await execFileAsync("git", ["status", "--porcelain"], { cwd });
-			let modified = 0;
-			let added = 0;
-			let deleted = 0;
-			let untracked = 0;
-
-			for (const line of porcelain.split("\n")) {
-				if (!line || line.length < 2) continue;
-				const xy = line.slice(0, 2);
-				if (xy === "??") untracked++;
-				else {
-					if (xy.includes("M")) modified++;
-					if (xy.includes("A")) added++;
-					if (xy.includes("D")) deleted++;
-				}
-			}
-
-			const tokens = [branch];
-			if (modified) tokens.push(`M${modified}`);
-			if (added) tokens.push(`A${added}`);
-			if (deleted) tokens.push(`D${deleted}`);
-			if (untracked) tokens.push(`?${untracked}`);
-
-			cachedGitStatus = tokens.length === 1 ? `${branch} ✓` : tokens.join(" ● ");
-		} catch {
-			cachedGitStatus = null;
-			projectRoot = cwd;
-		}
-	}
+	/** Tracker of the currently mounted footer; null while the statusline is unmounted. */
+	let activeTracker: GitStatusTracker | null = null;
 
 	pi.on("session_start", (_event, ctx) => {
-		void updateGitStatus(ctx.cwd);
-
 		const ui = ctx.ui;
 		ui.setFooter((tui, _theme, footerData) => {
+			// Geometry of the git area in the last render, used to hit-test double clicks.
+			let gitRegion: { start: number; end: number } | null = null;
+
+			const tracker = new GitStatusTracker({
+				intervalMs: GIT_REFRESH_INTERVAL_MS,
+				getCwd: () => ctx.cwd,
+				onUpdate: () => tui.requestRender(),
+			});
+			activeTracker = tracker;
+			tracker.start();
+
 			ui.setWidget(
 				MODEL_WIDGET_KEY,
 				() => ({
@@ -124,10 +141,10 @@ export default function (pi: ExtensionAPI) {
 
 			// Reactively listen for branch switches and refresh automatically
 			const unsubBranch = footerData.onBranchChange(() => {
-				void updateGitStatus(ctx.cwd).then(() => tui.requestRender());
+				tracker.refresh();
 			});
 
-			// Refresh the status bar once per second.
+			// Repaint once per second so asynchronous token and git readings become visible.
 			const refreshTimer = setInterval(() => {
 				tui.requestRender();
 			}, REFRESH_INTERVAL_MS);
@@ -135,6 +152,8 @@ export default function (pi: ExtensionAPI) {
 
 			return {
 				dispose() {
+					tracker.stop();
+					if (activeTracker === tracker) activeTracker = null;
 					unsubBranch();
 					clearInterval(refreshTimer);
 					ui.setWidget(MODEL_WIDGET_KEY, undefined);
@@ -216,9 +235,19 @@ export default function (pi: ExtensionAPI) {
 					// ── 3. Line 1: project root [• session name]          git (right) ──
 					const sessionName = ctx.sessionManager.getSessionName();
 					const line1Left = sessionName
-						? `${GREEN}${projectRoot}${RESET} ${GRAY}•${RESET} ${BLUE}${sessionName}${RESET}`
-						: `${GREEN}${projectRoot}${RESET}`;
-					const gitText = cachedGitStatus ? `${LIGHT_PINK}${cachedGitStatus}${RESET}` : "";
+						? `${GREEN}${tracker.getProjectRoot(ctx.cwd)}${RESET} ${GRAY}•${RESET} ${BLUE}${sessionName}${RESET}`
+						: `${GREEN}${tracker.getProjectRoot(ctx.cwd)}${RESET}`;
+					const snapshot = tracker.getSnapshot();
+					const markerVisible = Date.now() - tracker.getLastManualRefreshAt() < GIT_REFRESH_MARKER_MS;
+					const gitText = buildGitText(
+						snapshot ? formatGitStatus(snapshot, t("status.gitDetached")) : null,
+						snapshot ? buildDivergenceTokens(snapshot) : [],
+						markerVisible ? t("status.gitRefreshed") : null,
+					);
+					// The git area is right-aligned, so recording its column span here is enough
+					// for a later double click to be hit-tested against it.
+					gitRegion =
+						gitText === "" ? null : { start: Math.max(0, width - visibleWidth(gitText)), end: width };
 
 					// ── 4. Line 2: input/output • cache • context tokens ──
 					const usageParts = [
@@ -244,12 +273,24 @@ export default function (pi: ExtensionAPI) {
 
 					return lines;
 				},
+				/**
+				 * Double clicking the git area forces an immediate refresh. Answering the press is what
+				 * makes the renderer report the matching click back to us; the trade-off is that text
+				 * selection is unavailable inside that area only.
+				 */
+				handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+					if (event.y !== 0 || event.button !== "left") return undefined;
+					if (event.type !== "press" && event.type !== "click") return undefined;
+					if (gitRegion === null || event.x < gitRegion.start || event.x >= gitRegion.end) return undefined;
+					if (event.type === "click" && event.clickCount === 2) tracker.refresh({ manual: true });
+					return { handled: true };
+				},
 			};
 		});
 	});
 
-	// When an agent round finishes, asynchronously re-probe git status to reflect changes
-	pi.on("agent_settled", (_event, ctx) => {
-		void updateGitStatus(ctx.cwd);
+	// A finished round usually means files just changed, so probe without waiting for the next poll.
+	pi.on("agent_settled", () => {
+		activeTracker?.refresh();
 	});
 }
