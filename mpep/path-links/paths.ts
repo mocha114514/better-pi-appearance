@@ -436,6 +436,75 @@ export function separateAutolinkTails(line: string): string {
 	return applyLineEdits(line, edits);
 }
 
+// ---------------------------------------------------------------------------
+// Explicit-link destination repair (local paths written as markdown links)
+// ---------------------------------------------------------------------------
+// Models routinely reference code with `[name](/D:/repo/file.rs:146)`: the
+// destination is a local path, not a URI. The collapse above deliberately
+// leaves explicit markdown links alone, so this raw path reaches the terminal
+// as the OSC 8 href — where a scheme-less `/D:/...` spelling (Git Bash drive)
+// with a glued `:line` suffix is an invalid URI: hover shows "invalid URI"
+// and Ctrl+click dies. Repair the destination in place: genuine URIs
+// (scheme present) and anchors pass through untouched, local paths are
+// re-encoded through encodePathHref (Git Bash drives un-`/`ed, `:line` suffix
+// dropped) so hover previews and click-to-open work again. Image
+// destinations are left alone: mpep-path:/file: rewrites could break Pi's own
+// image rendering.
+
+/** Explicit markdown links, capturing image bang, label, destination, title. */
+const EXPLICIT_LINK = /(!?)\[((?:[^\[\]\\]|\\.)*)\]\((<[^>]+>|[^)\s]+)((?:\s+"[^"]*")?)\)/g;
+const URI_SCHEME = /^[A-Za-z][A-Za-z0-9+.-]*:/;
+const WIN_DRIVE = /^[A-Za-z]:[\\/]/;
+const GIT_BASH_DRIVE = /^\/[A-Za-z]:[\\/]/;
+const LINE_SUFFIX = /:\d+(?::\d+)?$/;
+
+/** Repaired destination for an explicit link, or undefined to leave it as-is. */
+function normalizeLinkDestination(raw: string): string | undefined {
+	const dest = raw.startsWith("<") && raw.endsWith(">") ? raw.slice(1, -1) : raw;
+	if (!dest || /^[#?]/.test(dest)) return undefined;
+	// `[x](www.example.com)` is a web link missing its scheme, not a path.
+	if (/^www\./i.test(dest)) return markdownDestination(normalizeWebUrl(dest));
+	let path: string;
+	// Drive checks run before the scheme check: `D:\x` matches URI_SCHEME (`D:`).
+	if (WIN_DRIVE.test(dest)) {
+		path = dest;
+	} else if (IS_WINDOWS && GIT_BASH_DRIVE.test(dest)) {
+		path = dest.slice(1);
+	} else if (URI_SCHEME.test(dest)) {
+		return undefined; // Genuine URI: http:, file:, mpep-path:, mailto:, data: ...
+	} else if (!dest.startsWith("~") && !/[\\/]/.test(dest)) {
+		return undefined; // Not path-shaped (single-segment relative name).
+	} else {
+		path = dest;
+	}
+	// `[file.go:372](…/file.go:372)`: the label keeps the line number; the
+	// target must not, or the OS would look for a file literally named `…:372`.
+	path = path.replace(LINE_SUFFIX, "");
+	if (!path) return undefined;
+	return markdownDestination(encodePathHref(path));
+}
+
+/** Normalize local-path destinations of explicit markdown links, in place. */
+export function normalizeExplicitLinks(line: string): string {
+	if (!line || !line.includes("](")) return line;
+	const edits: Array<{ start: number; end: number; text: string }> = [];
+	for (const segment of splitInline(line)) {
+		if (segment.kind === "code") continue;
+		for (const match of segment.raw.matchAll(EXPLICIT_LINK)) {
+			const start = segment.start + (match.index ?? 0);
+			if (match[1] === "!") continue; // Image destinations stay untouched.
+			const dest = normalizeLinkDestination(match[3] ?? "");
+			if (dest === undefined) continue;
+			edits.push({
+				start,
+				end: start + match[0].length,
+				text: `[${match[2] ?? ""}](${dest}${match[4] ?? ""})`,
+			});
+		}
+	}
+	return applyLineEdits(line, edits);
+}
+
 function transformLine(line: string): string {
 	if (!line) return line;
 	let out = "";
@@ -486,7 +555,7 @@ export function transformPathMarkdown(markdown: string): string {
 			transformed.push(line);
 			continue;
 		}
-		transformed.push(inFence ? line : separateAutolinkTails(transformLine(line)));
+		transformed.push(inFence ? line : normalizeExplicitLinks(separateAutolinkTails(transformLine(line))));
 	}
 	return transformed.join("\n");
 }
