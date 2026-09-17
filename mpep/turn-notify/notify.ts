@@ -37,7 +37,10 @@ export function notifyTurnComplete(title: string, body: string, soundPath?: stri
 /** Spawns a detached, stdio-ignored helper; rings the bell if it cannot start. */
 function launch(command: string, args: string[]): void {
 	try {
-		const child = spawn(command, args, { detached: true, stdio: "ignore", windowsHide: true });
+		// detached lets the notifier survive the session's process group on POSIX,
+		// but on Windows it spawns console apps (powershell.exe) with DETACHED_PROCESS,
+		// which makes them exit before running anything. unref() alone suffices there.
+		const child = spawn(command, args, { detached: process.platform !== "win32", stdio: "ignore", windowsHide: true });
 		child.on("error", ringBell);
 		child.unref();
 	} catch {
