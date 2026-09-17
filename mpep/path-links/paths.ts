@@ -10,6 +10,8 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 export const PATH_HREF_PREFIX = "mpep-path:";
 
+const IS_WINDOWS = process.platform === "win32";
+
 const INLINE_CODE = /(`+)((?:(?!\1).|\\.)*)\1/g;
 const MD_LINK = /!?\[(?:[^\[\]\\]|\\.)*\]\((?:<[^>]+>|[^)\s]+)(?:\s+"[^"]*")?\)/g;
 const OSC8 = /\x1b\]8;[^;]*;([^\x07\x1b]*)(?:\x07|\x1b\\)/g;
@@ -34,10 +36,15 @@ export function resolveOpenTarget(path: string): string {
 /** file:// for complete paths so WT/Pi can open them; mpep-path: otherwise to preserve relative text. */
 export function encodePathHref(path: string): string {
 	if (isCompletePath(path)) {
-		try {
-			return pathToFileURL(resolveOpenTarget(path)).href;
-		} catch {
-			// Fall through to the relative-path encoding.
+		// Forward-slash drive paths (`D:/x`) stay literal on Windows:
+		// fileURLToPath would hand back backslashes, rewriting the user's
+		// original spelling on copy and hover.
+		if (!(IS_WINDOWS && /^[A-Za-z]:\//.test(path))) {
+			try {
+				return pathToFileURL(resolveOpenTarget(path)).href;
+			} catch {
+				// Fall through to the relative-path encoding.
+			}
 		}
 	}
 	return `${PATH_HREF_PREFIX}${encodeURIComponent(path)}`;
@@ -68,7 +75,10 @@ export function isCompletePath(path: string): boolean {
 		path.startsWith("\\\\") ||
 		path.startsWith("~/") ||
 		path.startsWith("~\\") ||
-		(path.startsWith("/") && !path.startsWith("//"))
+		// Unix-root paths are complete only on POSIX. On Windows `/d/...` is a
+		// Git Bash spelling: pathToFileURL would resolve it against the current
+		// drive (`D:\d\...`), inventing a path that does not exist.
+		(!IS_WINDOWS && path.startsWith("/") && !path.startsWith("//"))
 	);
 }
 
@@ -491,13 +501,19 @@ function emitChunk(chunk: string, active: string | undefined, strip: (value: str
 export function expandPathLinks(ansi: string, strip: (value: string) => string): string {
 	if (!ansi.includes("\x1b]8;")) return strip(ansi);
 	let result = "";
-	let active: string | undefined;
+	// Stack, not a single slot: sliceByColumn replays escape codes from before
+	// the selection (pendingAnsi) *after* codes emitted at the selection start
+	// column, so a stale close from a previous chip can land between this chip's
+	// own open and its text. Stack pairing lets that close pop its own open
+	// instead of clearing the chip's href.
+	const stack: string[] = [];
 	let last = 0;
 	for (const match of allMatches(ansi, OSC8)) {
-		result += emitChunk(ansi.slice(last, match.index ?? 0), active, strip);
-		active = match[1] ? match[1] : undefined;
+		result += emitChunk(ansi.slice(last, match.index ?? 0), stack.at(-1), strip);
+		if (match[1]) stack.push(match[1]);
+		else stack.pop();
 		last = (match.index ?? 0) + match[0].length;
 	}
-	result += emitChunk(ansi.slice(last), active, strip);
+	result += emitChunk(ansi.slice(last), stack.at(-1), strip);
 	return result;
 }
