@@ -23,6 +23,7 @@
       "./fullscreen-scroll.ts",
       "./statusline.ts",
       "./tps.ts",
+      "./turn-notify/index.ts",
       "./theme-distributor.ts",
       "./usage/index.ts",
       "./export/index.ts"

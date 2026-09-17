@@ -56,6 +56,13 @@
     "enabled": true
   },
   {
+    "id": "turn-notify",
+    "name": "回复完成系统通知",
+    "path": "./turn-notify/index.ts",
+    "desc": "每轮回复结束后弹出系统通知并播放提示音，三平台原生实现，失败时退化为终端响铃",
+    "enabled": true
+  },
+  {
     "id": "theme-distributor",
     "name": "MPEP 蓝色主题分发",
     "path": "./theme-distributor.ts",
