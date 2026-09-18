@@ -479,18 +479,41 @@ function enhanceCallouts(line: string): string {
 }
 
 /**
- * Transform headings level 3 and below to eliminate raw '#' in terminal
- * while leveraging Pi's native H2 styling (which strips the '##' marker).
+ * Transform headings to attach a level-distinctive prefix symbol, so heading
+ * levels stay distinguishable in the terminal without relying on raw '#'.
+ *
+ * Symbol shapes alternate solid/hollow to remain legible at small font sizes:
+ *   H1 `◆` (solid diamond, plus Pi's native underline styling)
+ *   H2 `◇` (hollow diamond)
+ *   H3 `▸` (solid triangle)
+ *   H4 `▷` (hollow triangle)
+ *   H5 `▪` (small square)
+ *   H6+ `·` (middot)
+ *
+ * H1/H2 keep their native level because Pi already strips the '#' marker and
+ * applies heading styling for them; H3 and below are demoted to H2 so Pi's H2
+ * styling (marker stripped, heading color + bold) applies to them too.
  */
-function enhanceHeadings(line: string): string {
+export function enhanceHeadings(line: string): string {
+	// Exact-count patterns are self-disambiguating: "#{n}\s" cannot match a
+	// longer run of '#' because the next char must be whitespace.
+	if (/^(\s*)#\s+(.*)$/.test(line)) {
+		return line.replace(/^(\s*)#\s+(.*)$/, "$1# ◆ $2");
+	}
+	if (/^(\s*)##\s+(.*)$/.test(line)) {
+		return line.replace(/^(\s*)##\s+(.*)$/, "$1## ◇ $2");
+	}
 	if (/^(\s*)###\s+(.*)$/.test(line)) {
-		return line.replace(/^(\s*)###\s+(.*)$/, "$1## ◈ $2");
+		return line.replace(/^(\s*)###\s+(.*)$/, "$1## ▸ $2");
 	}
 	if (/^(\s*)####\s+(.*)$/.test(line)) {
-		return line.replace(/^(\s*)####\s+(.*)$/, "$1## ▸ $2");
+		return line.replace(/^(\s*)####\s+(.*)$/, "$1## ▷ $2");
 	}
-	if (/^(\s*)#{5,}\s+(.*)$/.test(line)) {
-		return line.replace(/^(\s*)#{5,}\s+(.*)$/, "$1## ▹ $2");
+	if (/^(\s*)#####\s+(.*)$/.test(line)) {
+		return line.replace(/^(\s*)#####\s+(.*)$/, "$1## ▪ $2");
+	}
+	if (/^(\s*)#{6,}\s+(.*)$/.test(line)) {
+		return line.replace(/^(\s*)#{6,}\s+(.*)$/, "$1## · $2");
 	}
 	return line;
 }
@@ -583,8 +606,66 @@ function enhanceBoldSyntax(text: string): string {
 }
 
 /**
+ * Patch Markdown.prototype.renderToken at runtime to render headings with the
+ * theme's mdHeading color preserved. Pi's native heading style composes
+ * `heading(bold(text))`, and the bold patch above wraps theme.bold with a
+ * bright-white lift (\x1b[97m) that sits *inside* the heading color, so native
+ * headings end up bright white and indistinguishable from bold body text.
+ * This patch re-implements the heading branch with a pure ANSI bold, keeping
+ * the heading color on the outside where it wins.
+ * Layout logic (spacing after headings, raw '#' prefix for level >= 3) mirrors
+ * Pi's native renderer 1:1; level >= 3 rarely occurs because enhanceHeadings
+ * already demotes those to H2.
+ */
+export function applyHeadingPatch(): () => void {
+	const proto = Markdown.prototype as any;
+	let active = true;
+
+	const originalRenderToken = proto.renderToken;
+
+	proto.renderToken = function (token: any, width: number, nextTokenType?: string, styleContext?: any): string[] {
+		if (!active || token?.type !== "heading") {
+			return originalRenderToken.call(this, token, width, nextTokenType, styleContext);
+		}
+		try {
+			const headingLevel: number = token.depth;
+			// Pure ANSI bold: deliberately bypasses theme.bold so the bold patch's
+			// bright-white lift does not override the heading color.
+			const pureBold = (text: string) => `\x1b[1m${text}\x1b[22m`;
+			const headingStyleFn =
+				headingLevel === 1
+					? (text: string) => this.theme.heading(pureBold(this.theme.underline(text)))
+					: (text: string) => this.theme.heading(pureBold(text));
+
+			// Heading-specific inline context so codespan/bold/etc. inside the
+			// heading restore heading styling after their own ANSI resets.
+			const headingStyleContext = {
+				applyText: headingStyleFn,
+				stylePrefix: this.getStylePrefix(headingStyleFn),
+			};
+
+			const headingText = this.renderInlineTokens(token.tokens || [], headingStyleContext);
+			const headingPrefix = `${"#".repeat(headingLevel)} `;
+			const styledHeading = headingLevel >= 3 ? headingStyleFn(headingPrefix) + headingText : headingText;
+			const lines = [styledHeading];
+			if (nextTokenType && nextTokenType !== "space") {
+				lines.push(""); // Add spacing after headings (unless space token follows)
+			}
+			return lines;
+		} catch {
+			return originalRenderToken.call(this, token, width, nextTokenType, styleContext);
+		}
+	};
+	const installed = proto.renderToken;
+	return () => {
+		active = false;
+		if (proto.renderToken === installed) proto.renderToken = originalRenderToken;
+	};
+}
+
+/**
  * Setup Markdown enhancements:
- * - Prototype patches on Markdown component (lists, code blocks, tables, bold text)
+ * - Prototype patches on Markdown component (lists, code blocks, tables, headings, bold text)
  * - Markdown transformer registration (callouts, headings, bold syntax, inline symbols)
  */
 export function setupMarkdownEnhancements(pi: ExtensionAPI): () => void {
@@ -593,11 +674,13 @@ export function setupMarkdownEnhancements(pi: ExtensionAPI): () => void {
 	const disposeCodeBlock = applyCodeBlockPatch();
 	const disposeTable = applyTablePatch();
 	const disposeBold = applyBoldPatch();
+	const disposeHeading = applyHeadingPatch();
 	let active = true;
 	const dispose = () => {
 		if (!active) return;
 		active = false;
-		// Bold wraps renderToken after the code block patch, so unwind in reverse order.
+		// Each patch wraps renderToken after the previous one, so unwind in reverse order.
+		disposeHeading();
 		disposeBold();
 		disposeTable();
 		disposeCodeBlock();
