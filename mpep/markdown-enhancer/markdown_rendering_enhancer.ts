@@ -483,7 +483,7 @@ function enhanceCallouts(line: string): string {
  * levels stay distinguishable in the terminal without relying on raw '#'.
  *
  * Symbol shapes alternate solid/hollow to remain legible at small font sizes:
- *   H1 `◆` (solid diamond, plus Pi's native underline styling)
+ *   H1 `◆` (solid diamond)
  *   H2 `◇` (hollow diamond)
  *   H3 `▸` (solid triangle)
  *   H4 `▷` (hollow triangle)
@@ -630,12 +630,11 @@ export function applyHeadingPatch(): () => void {
 		try {
 			const headingLevel: number = token.depth;
 			// Pure ANSI bold: deliberately bypasses theme.bold so the bold patch's
-			// bright-white lift does not override the heading color.
+			// bright-white lift does not override the heading color. All levels share
+			// one style (heading color + bold); levels are told apart by the prefix
+			// symbols that enhanceHeadings injects, not by underline.
 			const pureBold = (text: string) => `\x1b[1m${text}\x1b[22m`;
-			const headingStyleFn =
-				headingLevel === 1
-					? (text: string) => this.theme.heading(pureBold(this.theme.underline(text)))
-					: (text: string) => this.theme.heading(pureBold(text));
+			const headingStyleFn = (text: string) => this.theme.heading(pureBold(text));
 
 			// Heading-specific inline context so codespan/bold/etc. inside the
 			// heading restore heading styling after their own ANSI resets.
