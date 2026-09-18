@@ -86,6 +86,9 @@ class ActivityGroupComponent extends Container {
 						this.addChild(new Spacer(1));
 						this.addChild(new Text(safeThemeFg("customMessageLabel", `[${activity.label}]`), 0, 0));
 					}
+				} else if (activity.type === "customEntry") {
+					// Archival entries without a renderer never bind a view; stay invisible.
+					if (activity.view) this.addChild(activity.view);
 				} else {
 					this.addChild(new Spacer(1));
 					const content = activity.isExpanded

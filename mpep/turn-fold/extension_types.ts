@@ -31,7 +31,20 @@ export interface CustomMessageRecord {
 	refresh?: () => void;
 }
 
-export type Activity = ThinkingRecord | { type: "tool"; toolCallId: string } | CustomMessageRecord;
+/**
+ * An extension custom entry folded into the current activity group. Unlike custom
+ * messages, entries may be pure archives with no renderer at all, so a record only
+ * becomes visible once entry_capture binds a real component instance to it.
+ */
+export interface CustomEntryRecord {
+	type: "customEntry";
+	/** Session entry id — unique and stable across reload. */
+	id: string;
+	view?: ToolView;
+	refresh?: () => void;
+}
+
+export type Activity = ThinkingRecord | { type: "tool"; toolCallId: string } | CustomMessageRecord | CustomEntryRecord;
 
 export interface TurnState {
 	id: number;

@@ -5,13 +5,15 @@ import {
 	resetProcessFolds,
 	setAllProcessFoldsExpanded,
 } from "./process_fold_state.ts";
-import type { CustomMessageRecord, MessageState, ToolView, TurnState } from "./extension_types.ts";
+import type { CustomEntryRecord, CustomMessageRecord, MessageState, ToolView, TurnState } from "./extension_types.ts";
 
 export const turnStates = new Map<number, TurnState>();
 export const toolCallTurnMap = new Map<string, number>();
 export const toolViews = new Map<string, ToolView>();
 /** Claimed custom messages by customMessageKey; their components render empty in place. */
 export const customClaims = new Map<string, CustomMessageRecord>();
+/** Claimed custom entries by session entry id; their components render empty in place. */
+export const customEntryClaims = new Map<string, CustomEntryRecord>();
 export const liveState = { globalExpanded: false };
 
 let messages = new WeakMap<AssistantMessage, MessageState>();
@@ -29,6 +31,7 @@ export function resetTurnState(): void {
 	messages = new WeakMap();
 	timestamps.clear();
 	customClaims.clear();
+	customEntryClaims.clear();
 	activeMessage = undefined;
 	activeGroup = undefined;
 	nextMessageId = 0;
@@ -80,6 +83,24 @@ export function observeCustomMessage(message: {
 	};
 	group.activities.push(record);
 	customClaims.set(record.key, record);
+	group.refresh?.();
+	return true;
+}
+
+/**
+ * Fold an extension custom entry into the active group. Entries carry no display flag;
+ * archival entries simply never bind a view and stay invisible inside the fold.
+ */
+export function observeCustomEntry(entry: { id?: string }): boolean {
+	if (!entry.id || !activeGroup) return false;
+	const group = activeGroup;
+	const record: CustomEntryRecord = {
+		type: "customEntry",
+		id: entry.id,
+		refresh: () => group.refresh?.(),
+	};
+	group.activities.push(record);
+	customEntryClaims.set(record.id, record);
 	group.refresh?.();
 	return true;
 }
@@ -258,6 +279,10 @@ export function syncFromSessionHistory(
 				completeProcessFolds();
 			}
 			continue;
+		} else if (entry.type === "custom") {
+			// Custom entries never act as boundaries; they only join a group mid-run.
+			claimHistoryCustomEntry(entry, entries, index);
+			continue;
 		}
 		if (entry.type !== "message" || !entry.message || typeof entry.message !== "object" || !("role" in entry.message))
 			continue;
@@ -276,34 +301,34 @@ export function syncFromSessionHistory(
 }
 
 /**
- * History rebuild counterpart of observeCustomMessage. A persisted custom message is
- * mid-run iff the painted order shows more assistant activity after it (steered and
- * deferred notes both re-enter the loop); a trailing message was sent while idle and
- * keeps its standalone rendering. Entry timestamps are ISO strings; the rebuilt
- * CustomMessage carries the same instant in milliseconds, so the claim key matches
- * the component Pi constructs.
+ * Shared mid-run test for history rebuild: the painted order must show more assistant
+ * activity after this entry (steered/deferred content always re-enters the loop).
+ * A trailing entry was appended while idle and keeps its standalone rendering.
  */
+function hasFollowingAssistant(
+	entries: readonly { type: string; message?: unknown }[],
+	index: number,
+): boolean {
+	for (let i = index + 1; i < entries.length; i++) {
+		const next = entries[i];
+		if (next.type === "compaction" || next.type === "branch_summary") return false;
+		// Consecutive custom items claim one by one; only the run's continuation decides.
+		if (next.type === "custom_message" || next.type === "custom") continue;
+		if (next.type !== "message") continue;
+		const role = (next.message as { role?: string } | undefined)?.role;
+		if (role === "toolResult") continue;
+		return role === "assistant";
+	}
+	return false;
+}
+
 function claimHistoryCustomMessage(
 	entry: { type: string; message?: unknown },
 	entries: readonly { type: string; message?: unknown }[],
 	index: number,
 ): boolean {
 	const custom = entry as { display?: boolean; customType?: string; timestamp?: string };
-	if (custom.display === false || !activeGroup) return false;
-	let midRun = false;
-	for (let i = index + 1; i < entries.length; i++) {
-		const next = entries[i];
-		if (next.type === "compaction" || next.type === "branch_summary") return false;
-		// Consecutive custom messages claim one by one; only the run's continuation decides.
-		if (next.type === "custom_message") continue;
-		if (next.type !== "message") continue;
-		const role = (next.message as { role?: string } | undefined)?.role;
-		if (role === "toolResult") continue;
-		if (role !== "assistant") return false;
-		midRun = true;
-		break;
-	}
-	if (!midRun) return false;
+	if (custom.display === false || !activeGroup || !hasFollowingAssistant(entries, index)) return false;
 	const group = activeGroup;
 	const record: CustomMessageRecord = {
 		type: "custom",
@@ -313,6 +338,24 @@ function claimHistoryCustomMessage(
 	};
 	group.activities.push(record);
 	customClaims.set(record.key, record);
+	return true;
+}
+
+function claimHistoryCustomEntry(
+	entry: { type: string; message?: unknown },
+	entries: readonly { type: string; message?: unknown }[],
+	index: number,
+): boolean {
+	const custom = entry as { id?: string };
+	if (!custom.id || !activeGroup || !hasFollowingAssistant(entries, index)) return false;
+	const group = activeGroup;
+	const record: CustomEntryRecord = {
+		type: "customEntry",
+		id: custom.id,
+		refresh: () => group.refresh?.(),
+	};
+	group.activities.push(record);
+	customEntryClaims.set(record.id, record);
 	return true;
 }
 

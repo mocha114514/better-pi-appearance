@@ -73,7 +73,7 @@ export function getActivePreview(group: TurnState): ActivePreview | undefined {
 	// Folded custom notes carry no stream of their own; preview the latest real work.
 	for (let i = group.activities.length - 1; i >= 0; i--) {
 		const latest = group.activities[i];
-		if (latest.type === "custom") continue;
+		if (latest.type === "custom" || latest.type === "customEntry") continue;
 		if (latest.type === "thinking")
 			return { type: "thinking", header: t("activity.thinking"), output: latest.output, isError: false };
 		const tool = group.tools.get(latest.toolCallId);
@@ -97,13 +97,16 @@ export function renderSummary(group: TurnState, theme: DisplayTheme): string {
 	const thinkingCount = group.activities.filter((activity) => activity.type === "thinking").length;
 	if (thinkingCount) parts.push(`${theme.bold(t("activity.thinking"))} ${theme.fg("accent", String(thinkingCount))}`);
 	const customCount = group.activities.filter((activity) => activity.type === "custom").length;
-	if (customCount) parts.push(`${theme.bold(t("activity.custom"))} ${theme.fg("accent", String(customCount))}`);
+	// Archival entries without a renderer stay invisible, so only view-bound ones count.
+	const entryCount = group.activities.filter((activity) => activity.type === "customEntry" && activity.view).length;
+	if (customCount + entryCount)
+		parts.push(`${theme.bold(t("activity.custom"))} ${theme.fg("accent", String(customCount + entryCount))}`);
 	for (const [name, stat] of stats) {
 		parts.push(
 			`${theme.bold(name)} ${theme.fg("accent", String(stat.successes))}${stat.errors ? theme.fg("error", ` ${stat.errors}`) : ""}`,
 		);
 	}
-	const lastWork = group.activities.findLast((activity) => activity.type !== "custom");
+	const lastWork = group.activities.findLast((activity) => activity.type !== "custom" && activity.type !== "customEntry");
 	const running =
 		[...group.tools.values()].some((tool) => tool.isPartial) || (!group.sealed && lastWork?.type === "thinking");
 	const failed = [...group.tools.values()].some((tool) => tool.isError);
