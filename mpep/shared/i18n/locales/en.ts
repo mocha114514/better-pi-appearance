@@ -122,6 +122,7 @@ export const en = {
   "editor.exitHint": "Press Ctrl+C again to exit, ESC to cancel",
   "editor.exitBorder": " Press Ctrl+C again to exit | ESC to cancel ",
   "activity.thinking": "thinking",
+  "activity.custom": "note",
   "activity.thinkingPending": "Thinking...",
   "activity.expandHint": " (double-click / ctrl+o)",
   "activity.compaction": "compaction",

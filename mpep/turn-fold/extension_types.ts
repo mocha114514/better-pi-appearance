@@ -18,7 +18,20 @@ export interface ThinkingRecord {
 	isExpanded: boolean;
 }
 
-export type Activity = ThinkingRecord | { type: "tool"; toolCallId: string };
+/** An extension custom message folded into the current activity group. */
+export interface CustomMessageRecord {
+	type: "custom";
+	/** customType@timestampMs — stable across session reload (Pi re-derives both). */
+	key: string;
+	/** customType, used for the fallback header when no live view was captured. */
+	label: string;
+	/** Delegate into the standalone CustomMessageComponent, captured post-construction. */
+	view?: ToolView;
+	/** Re-renders the owning group once the view arrives after the claim. */
+	refresh?: () => void;
+}
+
+export type Activity = ThinkingRecord | { type: "tool"; toolCallId: string } | CustomMessageRecord;
 
 export interface TurnState {
 	id: number;

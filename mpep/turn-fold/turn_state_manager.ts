@@ -5,11 +5,13 @@ import {
 	resetProcessFolds,
 	setAllProcessFoldsExpanded,
 } from "./process_fold_state.ts";
-import type { MessageState, ToolView, TurnState } from "./extension_types.ts";
+import type { CustomMessageRecord, MessageState, ToolView, TurnState } from "./extension_types.ts";
 
 export const turnStates = new Map<number, TurnState>();
 export const toolCallTurnMap = new Map<string, number>();
 export const toolViews = new Map<string, ToolView>();
+/** Claimed custom messages by customMessageKey; their components render empty in place. */
+export const customClaims = new Map<string, CustomMessageRecord>();
 export const liveState = { globalExpanded: false };
 
 let messages = new WeakMap<AssistantMessage, MessageState>();
@@ -26,6 +28,7 @@ export function resetTurnState(): void {
 	toolViews.clear();
 	messages = new WeakMap();
 	timestamps.clear();
+	customClaims.clear();
 	activeMessage = undefined;
 	activeGroup = undefined;
 	nextMessageId = 0;
@@ -50,6 +53,35 @@ export function getMessageState(message: AssistantMessage): MessageState | undef
 
 export function getTurnId(toolCallId: string): number | undefined {
 	return toolCallTurnMap.get(toolCallId);
+}
+
+export function customMessageKey(customType: string | undefined, timestamp: number | undefined): string {
+	return `${customType ?? "custom"}@${timestamp ?? 0}`;
+}
+
+/**
+ * Fold an extension custom message into the active group. Only mid-run displayable
+ * messages qualify: a live group means the agent is between agent_start/agent_end,
+ * which is exactly where steered and turn-deferred notes land. Idle notifications
+ * (no active group) and invisible context injections (display:false) stay outside.
+ */
+export function observeCustomMessage(message: {
+	customType?: string;
+	display?: boolean;
+	timestamp?: number;
+}): boolean {
+	if (message.display === false || !activeGroup) return false;
+	const group = activeGroup;
+	const record: CustomMessageRecord = {
+		type: "custom",
+		key: customMessageKey(message.customType, message.timestamp),
+		label: message.customType ?? "custom",
+		refresh: () => group.refresh?.(),
+	};
+	group.activities.push(record);
+	customClaims.set(record.key, record);
+	group.refresh?.();
+	return true;
 }
 
 export function sealActiveGroup(): void {
@@ -210,15 +242,22 @@ export function syncFromSessionHistory(
 	isRunning = false,
 ): void {
 	resetTurnState();
-	for (const entry of entries) {
+	for (let index = 0; index < entries.length; index++) {
+		const entry = entries[index];
 		if (entry.type === "compaction") {
 			sealActiveGroup();
 			// The process sealed by a compaction boundary is the tail Pi kept verbatim for
 			// the model context, so its disclosure gets the "kept" tag.
 			completeProcessFolds({ retained: true });
-		} else if (entry.type === "branch_summary" || entry.type === "custom_message") {
+		} else if (entry.type === "branch_summary") {
 			sealActiveGroup();
 			completeProcessFolds();
+		} else if (entry.type === "custom_message") {
+			if (!claimHistoryCustomMessage(entry, entries, index)) {
+				sealActiveGroup();
+				completeProcessFolds();
+			}
+			continue;
 		}
 		if (entry.type !== "message" || !entry.message || typeof entry.message !== "object" || !("role" in entry.message))
 			continue;
@@ -234,6 +273,47 @@ export function syncFromSessionHistory(
 		}
 	}
 	if (!isRunning) endLiveCollection();
+}
+
+/**
+ * History rebuild counterpart of observeCustomMessage. A persisted custom message is
+ * mid-run iff the painted order shows more assistant activity after it (steered and
+ * deferred notes both re-enter the loop); a trailing message was sent while idle and
+ * keeps its standalone rendering. Entry timestamps are ISO strings; the rebuilt
+ * CustomMessage carries the same instant in milliseconds, so the claim key matches
+ * the component Pi constructs.
+ */
+function claimHistoryCustomMessage(
+	entry: { type: string; message?: unknown },
+	entries: readonly { type: string; message?: unknown }[],
+	index: number,
+): boolean {
+	const custom = entry as { display?: boolean; customType?: string; timestamp?: string };
+	if (custom.display === false || !activeGroup) return false;
+	let midRun = false;
+	for (let i = index + 1; i < entries.length; i++) {
+		const next = entries[i];
+		if (next.type === "compaction" || next.type === "branch_summary") return false;
+		// Consecutive custom messages claim one by one; only the run's continuation decides.
+		if (next.type === "custom_message") continue;
+		if (next.type !== "message") continue;
+		const role = (next.message as { role?: string } | undefined)?.role;
+		if (role === "toolResult") continue;
+		if (role !== "assistant") return false;
+		midRun = true;
+		break;
+	}
+	if (!midRun) return false;
+	const group = activeGroup;
+	const record: CustomMessageRecord = {
+		type: "custom",
+		key: customMessageKey(custom.customType, Date.parse(custom.timestamp ?? "") || 0),
+		label: custom.customType ?? "custom",
+		refresh: () => group.refresh?.(),
+	};
+	group.activities.push(record);
+	customClaims.set(record.key, record);
+	return true;
 }
 
 export function toggleTurnExpanded(turnId: number): void {

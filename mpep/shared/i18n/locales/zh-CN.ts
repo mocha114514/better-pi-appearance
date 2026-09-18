@@ -123,6 +123,7 @@ export const zhCN = {
   "editor.exitHint": "再次按 Ctrl+C 退出，按 ESC 取消",
   "editor.exitBorder": " 再次按 Ctrl+C 退出 | 按 ESC 取消 ",
   "activity.thinking": "thinking",
+  "activity.custom": "note",
   "activity.thinkingPending": "Thinking...",
   "activity.expandHint": " (双击 / ctrl+o)",
   "activity.compaction": "compaction",

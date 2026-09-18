@@ -2,6 +2,7 @@ import { t } from "../shared/i18n/index.ts";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import {
 	AssistantMessageComponent,
+	CustomMessageComponent,
 	type MarkdownTransformer,
 	ToolExecutionComponent,
 } from "@earendil-works/pi-coding-agent";
@@ -24,9 +25,12 @@ import {
 	getActivePreview,
 	getLatestTheme,
 	renderSummary,
+	safeThemeFg,
 	toolHeader,
 } from "./summary_preview_renderer.ts";
 import {
+	customClaims,
+	customMessageKey,
 	getMessageState,
 	setAllGlobalExpanded,
 	toggleTurnExpanded,
@@ -75,6 +79,13 @@ class ActivityGroupComponent extends Container {
 					const tool = group.tools.get(activity.toolCallId);
 					if (view) this.addChild(view);
 					else if (tool) this.addChild(new Text(toolHeader(tool), 0, 0));
+				} else if (activity.type === "custom") {
+					// The captured view carries the component's own leading spacer and box.
+					if (activity.view) this.addChild(activity.view);
+					else {
+						this.addChild(new Spacer(1));
+						this.addChild(new Text(safeThemeFg("customMessageLabel", `[${activity.label}]`), 0, 0));
+					}
 				} else {
 					this.addChild(new Spacer(1));
 					const content = activity.isExpanded
@@ -138,6 +149,12 @@ interface AssistantInternals {
 interface ToolInternals {
 	toolCallId: string;
 	updateDisplay(): void;
+}
+
+// CustomMessageComponent keeps its message private; the claim key re-derives from it.
+interface CustomInternals {
+	message?: { customType?: string; timestamp?: number };
+	rebuild(): void;
 }
 
 export function installActivityComponents(): () => void {
@@ -240,10 +257,56 @@ export function installActivityComponents(): () => void {
 		return toolCallTurnMap.has((this as unknown as ToolInternals).toolCallId) ? [] : originalRender.call(this, width);
 	};
 	toolPrototype.render = render;
+
+	// ── CustomMessageComponent: claimed notes render empty in place and reappear inside the group ──
+	// The class defines neither render nor handleMouse, so the captured originals are
+	// Container's; deleting our own render property on dispose restores the inheritance.
+	const customPrototype = CustomMessageComponent.prototype as unknown as CustomInternals;
+	const originalCustomRebuild = customPrototype.rebuild;
+	const inheritedCustomRender = CustomMessageComponent.prototype.render;
+	const inheritedCustomMouse = CustomMessageComponent.prototype.handleMouse;
+	const originalCustomSetExpanded = CustomMessageComponent.prototype.setExpanded;
+
+	const captureCustomView = (component: CustomMessageComponent) => {
+		const message = (component as unknown as CustomInternals).message;
+		if (!message) return;
+		const record = customClaims.get(customMessageKey(message.customType, message.timestamp));
+		if (!record || record.view) return;
+		record.view = {
+			render: (width) => inheritedCustomRender.call(component, width),
+			handleMouse: (event: TuiMouseEvent) => inheritedCustomMouse.call(component, event),
+			invalidate: () => component.invalidate(),
+			setExpanded: (value) => originalCustomSetExpanded.call(component, value),
+		};
+	};
+
+	const customRebuild = function (this: CustomMessageComponent): void {
+		originalCustomRebuild.call(this);
+		captureCustomView(this);
+	};
+	customPrototype.rebuild = customRebuild;
+
+	const customRender = function (this: CustomMessageComponent, width: number): string[] {
+		const message = (this as unknown as CustomInternals).message;
+		const record = message && customClaims.get(customMessageKey(message.customType, message.timestamp));
+		if (!record) return inheritedCustomRender.call(this, width);
+		if (!record.view) {
+			// The component can precede the claim on session reload; capture lazily and
+			// refresh the group once the real view exists.
+			captureCustomView(this);
+			queueMicrotask(() => record.refresh?.());
+		}
+		return [];
+	};
+	CustomMessageComponent.prototype.render = customRender;
+
 	return () => {
 		if (assistantPrototype.updateContent === update) assistantPrototype.updateContent = originalUpdate;
 		if (toolPrototype.render === render) toolPrototype.render = originalRender;
 		if (toolInternals.updateDisplay === display) toolInternals.updateDisplay = originalDisplay;
+		if (customPrototype.rebuild === customRebuild) customPrototype.rebuild = originalCustomRebuild;
+		if (Object.getOwnPropertyDescriptor(CustomMessageComponent.prototype, "render")?.value === customRender)
+			Reflect.deleteProperty(CustomMessageComponent.prototype, "render");
 		if (Object.getOwnPropertyDescriptor(assistantPrototype, "setExpanded")?.value === setExpanded) {
 			if (previousExpanded) Object.defineProperty(assistantPrototype, "setExpanded", previousExpanded);
 			else Reflect.deleteProperty(assistantPrototype, "setExpanded");

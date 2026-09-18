@@ -70,11 +70,16 @@ export function formatPreview(preview: ActivePreview, theme: DisplayTheme, width
 
 export function getActivePreview(group: TurnState): ActivePreview | undefined {
 	if (group.sealed || group.expanded) return;
-	const latest = group.activities.at(-1);
-	if (latest?.type === "thinking")
-		return { type: "thinking", header: t("activity.thinking"), output: latest.output, isError: false };
-	const tool = latest?.type === "tool" ? group.tools.get(latest.toolCallId) : undefined;
-	if (tool) return { type: "tool", header: toolHeader(tool), output: tool.output, isError: tool.isError };
+	// Folded custom notes carry no stream of their own; preview the latest real work.
+	for (let i = group.activities.length - 1; i >= 0; i--) {
+		const latest = group.activities[i];
+		if (latest.type === "custom") continue;
+		if (latest.type === "thinking")
+			return { type: "thinking", header: t("activity.thinking"), output: latest.output, isError: false };
+		const tool = group.tools.get(latest.toolCallId);
+		if (tool) return { type: "tool", header: toolHeader(tool), output: tool.output, isError: tool.isError };
+		return undefined;
+	}
 }
 
 export function renderSummary(group: TurnState, theme: DisplayTheme): string {
@@ -91,14 +96,16 @@ export function renderSummary(group: TurnState, theme: DisplayTheme): string {
 	const parts: string[] = [];
 	const thinkingCount = group.activities.filter((activity) => activity.type === "thinking").length;
 	if (thinkingCount) parts.push(`${theme.bold(t("activity.thinking"))} ${theme.fg("accent", String(thinkingCount))}`);
+	const customCount = group.activities.filter((activity) => activity.type === "custom").length;
+	if (customCount) parts.push(`${theme.bold(t("activity.custom"))} ${theme.fg("accent", String(customCount))}`);
 	for (const [name, stat] of stats) {
 		parts.push(
 			`${theme.bold(name)} ${theme.fg("accent", String(stat.successes))}${stat.errors ? theme.fg("error", ` ${stat.errors}`) : ""}`,
 		);
 	}
+	const lastWork = group.activities.findLast((activity) => activity.type !== "custom");
 	const running =
-		[...group.tools.values()].some((tool) => tool.isPartial) ||
-		(!group.sealed && group.activities.at(-1)?.type === "thinking");
+		[...group.tools.values()].some((tool) => tool.isPartial) || (!group.sealed && lastWork?.type === "thinking");
 	const failed = [...group.tools.values()].some((tool) => tool.isError);
 	const icon = running ? theme.fg("warning", "⋯ ") : failed ? theme.fg("error", "! ") : theme.fg("success", "✓ ");
 	return icon + parts.join(theme.fg("muted", " • ")) + theme.fg("muted", t("activity.expandHint"));

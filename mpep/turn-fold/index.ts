@@ -13,6 +13,7 @@ import {
 	endLiveCollection,
 	finishAssistant,
 	observeAssistant,
+	observeCustomMessage,
 	observeToolResult,
 	resetTurnState,
 	sealActiveGroup,
@@ -37,7 +38,15 @@ export default function (pi: ExtensionAPI): void {
 	pi.on("session_tree", restoreSession);
 	pi.on("message_start", (event) => {
 		if (event.message.role === "assistant") observeAssistant(event.message, true);
-		else if (event.message.role !== "toolResult") {
+		else if (event.message.role === "custom") {
+			// Mid-run extension notes fold into the current group. Invisible context
+			// injections (display:false) render nothing, so they are not a boundary either.
+			const claimed = observeCustomMessage(event.message);
+			if (!claimed && event.message.display !== false) {
+				sealActiveGroup();
+				completeProcessFolds();
+			}
+		} else if (event.message.role !== "toolResult") {
 			sealActiveGroup();
 			// Steering / follow-ups close the previous disclosure immediately, not at agent_end.
 			completeProcessFolds();
