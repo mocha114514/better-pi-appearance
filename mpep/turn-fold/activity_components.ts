@@ -89,6 +89,9 @@ class ActivityGroupComponent extends Container {
 				} else if (activity.type === "customEntry") {
 					// Archival entries without a renderer never bind a view; stay invisible.
 					if (activity.view) this.addChild(activity.view);
+				} else if (activity.type === "notification") {
+					// The delegate view carries the status line's own leading spacer.
+					this.addChild(activity.view);
 				} else {
 					this.addChild(new Spacer(1));
 					const content = activity.isExpanded

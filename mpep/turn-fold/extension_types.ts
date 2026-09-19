@@ -44,7 +44,25 @@ export interface CustomEntryRecord {
 	refresh?: () => void;
 }
 
-export type Activity = ThinkingRecord | { type: "tool"; toolCallId: string } | CustomMessageRecord | CustomEntryRecord;
+/**
+ * An info-level extension notification (ctx.ui.notify → showStatus) folded into the
+ * current activity group. Notifications never touch the session — they are pure
+ * visual writes — so the record only exists in memory, always carries a live view,
+ * and there is nothing to re-derive or reconcile on session reload.
+ */
+export interface NotificationRecord {
+	type: "notification";
+	/** Delegate into the suppressed status components (spacer + text). */
+	view: Component;
+	refresh?: () => void;
+}
+
+export type Activity =
+	| ThinkingRecord
+	| { type: "tool"; toolCallId: string }
+	| CustomMessageRecord
+	| CustomEntryRecord
+	| NotificationRecord;
 
 export interface TurnState {
 	id: number;

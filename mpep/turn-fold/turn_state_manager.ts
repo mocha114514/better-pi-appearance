@@ -1,11 +1,19 @@
 import type { AssistantMessage, ToolResultMessage } from "@earendil-works/pi-ai";
+import type { Component } from "@earendil-works/pi-tui";
 import {
 	completeProcessFolds,
 	registerProcessFoldMessage,
 	resetProcessFolds,
 	setAllProcessFoldsExpanded,
 } from "./process_fold_state.ts";
-import type { CustomEntryRecord, CustomMessageRecord, MessageState, ToolView, TurnState } from "./extension_types.ts";
+import type {
+	Activity,
+	CustomEntryRecord,
+	CustomMessageRecord,
+	MessageState,
+	ToolView,
+	TurnState,
+} from "./extension_types.ts";
 
 export const turnStates = new Map<number, TurnState>();
 export const toolCallTurnMap = new Map<string, number>();
@@ -103,6 +111,27 @@ export function observeCustomEntry(entry: { id?: string }): boolean {
 	customEntryClaims.set(record.id, record);
 	group.refresh?.();
 	return true;
+}
+
+/** Whether an activity group is currently collecting (agent mid-run). */
+export function hasActiveGroup(): boolean {
+	return activeGroup !== undefined;
+}
+
+/**
+ * Fold an info-level extension notification (ctx.ui.notify) into the active group.
+ * The delegate view is built by notify_capture from the suppressed status components.
+ * Returns the owning group and the pushed record so the caller can evict them again
+ * if Pi later rewrites the suppressed line while no group is collecting; returns
+ * undefined while idle so the caller leaves the status line rendered in place.
+ */
+export function observeNotification(view: Component): { group: TurnState; activity: Activity } | undefined {
+	if (!activeGroup) return undefined;
+	const group = activeGroup;
+	const activity: Activity = { type: "notification", view, refresh: () => group.refresh?.() };
+	group.activities.push(activity);
+	group.refresh?.();
+	return { group, activity };
 }
 
 export function sealActiveGroup(): void {

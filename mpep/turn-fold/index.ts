@@ -3,6 +3,7 @@ import { isPluginEnabled } from "../manager/preferences.ts";
 import { registerBuiltInTools } from "./builtin_tools_override.ts";
 import { orderedSessionEntries } from "./compaction_placement.ts";
 import { installEntryCapture, reconcileEntryClaims, resetEntryCapture } from "./entry_capture.ts";
+import { installNotifyCapture } from "./notify_capture.ts";
 import { completeProcessFolds } from "./process_fold_state.ts";
 import { applyPatches } from "./core_components_patcher.ts";
 import { setupMcpCoordinator } from "./mcp_tools_coordinator.ts";
@@ -25,6 +26,7 @@ export default function (pi: ExtensionAPI): void {
 	if (!isPluginEnabled("turn-fold")) return;
 	const disposePatches = applyPatches();
 	const disposeEntryCapture = installEntryCapture();
+	const disposeNotifyCapture = installNotifyCapture();
 	// Note: Markdown rendering enhancements were extracted into the standalone
 	// "markdown-enhancer" plugin (see ../markdown-enhancer/).
 	const disposeMcp = setupMcpCoordinator();
@@ -70,6 +72,7 @@ export default function (pi: ExtensionAPI): void {
 	pi.on("session_shutdown", () => {
 		disposePatches();
 		disposeEntryCapture();
+		disposeNotifyCapture();
 		disposeMcp();
 		resetTurnState();
 	});
