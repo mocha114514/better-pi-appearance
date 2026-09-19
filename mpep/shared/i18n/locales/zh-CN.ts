@@ -174,4 +174,9 @@ export const zhCN = {
   "legacy.days30": "30 (最近一个月)",
   "legacy.all": "all (全部历史)",
   "legacy.invalidArgs": "参数格式错误，示例: /m-usg 或 /m-usg 7",
+  "forewarn.description": "查看或设置压缩前问询的 Token 余量 (默认 30000)，用法: /m-ask [tokens]",
+  "forewarn.asking": "asking before compact... (压缩前问询中)",
+  "forewarn.current": "当前压缩前问询余量: {tokens} tokens",
+  "forewarn.set": "压缩前问询余量已设置为 {tokens} tokens",
+  "forewarn.invalid": "参数格式错误，用法: /m-ask [tokens] (正整数)",
 } as const satisfies Record<keyof typeof en, string>;

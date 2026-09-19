@@ -173,4 +173,9 @@ export const en = {
   "legacy.days30": "30 (last month)",
   "legacy.all": "all (all history)",
   "legacy.invalidArgs": "Invalid arguments. Examples: /m-usg or /m-usg 7",
+  "forewarn.description": "Show or set the pre-compaction forewarn margin in tokens (default 30000): /m-ask [tokens]",
+  "forewarn.asking": "asking before compact...",
+  "forewarn.current": "Pre-compaction forewarn margin: {tokens} tokens.",
+  "forewarn.set": "Pre-compaction forewarn margin set to {tokens} tokens.",
+  "forewarn.invalid": "Invalid argument. Usage: /m-ask [tokens] (positive integer)",
 } as const;

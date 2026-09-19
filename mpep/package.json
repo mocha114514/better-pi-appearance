@@ -26,6 +26,7 @@
       "./turn-notify/index.ts",
       "./theme-distributor.ts",
       "./usage/index.ts",
+      "./compact-forewarn/index.ts",
       "./export/index.ts"
     ]
   }
