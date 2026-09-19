@@ -1,4 +1,6 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { isPluginEnabled } from "../manager/preferences.ts";
@@ -8,33 +10,58 @@ import { t } from "../shared/i18n/index.ts";
  * Compact Forewarn (/m-ask)
  *
  * Fires a forewarning before Pi's own auto-compaction kicks in. When the
- * estimated context usage crosses `contextWindow - margin` (margin defaults to
- * 30000 tokens, adjustable via /m-ask), the next completed tool execution arms
- * the extension: a short "asking before compact..." entry is shown to the user
- * and a <system-reminder> message is steered into the conversation, asking the
- * model to finish its current atomic unit of work and then call the gated
- * `request_compaction` tool. The tool errors while disarmed and re-locks as
- * soon as Pi reports the compaction (manual, threshold, or overflow).
+ * estimated context usage crosses `contextWindow - reserveTokens - margin`
+ * (margin defaults to 30000 tokens, adjustable via /m-ask), the next completed
+ * tool execution arms the extension: a short "asking before compact..." entry
+ * is shown to the user and a <system-reminder> message is steered into the
+ * conversation, asking the model to finish its current atomic unit of work and
+ * then call the gated `request_compaction` tool. The tool errors while disarmed
+ * and re-locks as soon as Pi reports the compaction (manual, threshold, or
+ * overflow).
  */
 
 const COMMAND = "m-ask";
 const TOOL_NAME = "request_compaction";
 const ENTRY_TYPE = "compact-forewarn";
 const DEFAULT_MARGIN_TOKENS = 30_000;
+const DEFAULT_RESERVE_TOKENS = 16_384;
+
+function getCompactionReserveTokens(cwd?: string): number {
+	const paths = [
+		join(getAgentDir(), "settings.json"),
+		cwd ? join(cwd, ".pi", "settings.json") : null,
+	].filter((p): p is string => Boolean(p));
+
+	let reserveTokens = DEFAULT_RESERVE_TOKENS;
+	for (const settingsPath of paths) {
+		try {
+			const content = readFileSync(settingsPath, "utf8").replace(/^\uFEFF/, "");
+			const parsed = JSON.parse(content);
+			const reserve = parsed?.compaction?.reserveTokens;
+			if (typeof reserve === "number" && reserve >= 0) {
+				reserveTokens = reserve;
+			}
+		} catch {
+			// ignore missing or malformed settings files
+		}
+	}
+	return reserveTokens;
+}
 
 /**
  * The reminder is always English: it is an instruction for the model, not UI
  * copy, so it stays out of the i18n tables on purpose.
  */
-function buildReminder(marginTokens: number, tokens: number, contextWindow: number): string {
+function buildReminder(marginTokens: number): string {
 	return [
 		"<system-reminder>",
 		"This is an automated notice injected by the local environment (compact-forewarn extension), not a message from the user.",
-		`Current context usage is about ${tokens.toLocaleString("en-US")} tokens out of a ${contextWindow.toLocaleString("en-US")}-token window, which is within the configured ${marginTokens.toLocaleString("en-US")}-token forewarning margin. A context compaction will happen soon.`,
+		`A context compaction will trigger soon (approximately ${marginTokens.toLocaleString("en-US")} tokens remaining).`,
 		"To keep a sudden compaction from splitting an atomic piece of work, please:",
-		"1. Take stock of the current situation and make a brief plan.",
-		"2. Finish the locally coherent unit of work you are in the middle of, so nothing atomic gets cut in half.",
-		`3. As soon as that unit of work is complete, proactively call the \`${TOOL_NAME}\` tool to trigger the compaction.`,
+		`1. If you see this notice while at a clean task boundary (an old task has ended, a new one is starting) or a milestone, call \`${TOOL_NAME}\` immediately before proceeding.`,
+		"2. Take stock of the current situation and make a brief plan.",
+		"3. Finish the locally coherent unit of work you are in the middle of, so nothing atomic gets cut in half.",
+		`4. As soon as that unit of work is complete, proactively call the \`${TOOL_NAME}\` tool to trigger the compaction.`,
 		`If you are not in the middle of anything that needs continuity, call \`${TOOL_NAME}\` right away.`,
 		"</system-reminder>",
 	].join("\n");
@@ -121,15 +148,17 @@ export default function compactForewarn(pi: ExtensionAPI): void {
 		const usage = ctx.getContextUsage();
 		// tokens is null right after a compaction, before the next LLM response.
 		if (!usage || usage.tokens === null) return;
-		if (usage.contextWindow - marginTokens <= 0) return;
-		if (usage.tokens <= usage.contextWindow - marginTokens) return;
+		const reserveTokens = getCompactionReserveTokens(ctx.cwd);
+		const threshold = usage.contextWindow - reserveTokens - marginTokens;
+		if (threshold <= 0) return;
+		if (usage.tokens <= threshold) return;
 
 		armed = true;
 		pi.appendEntry(ENTRY_TYPE, { tokens: usage.tokens, contextWindow: usage.contextWindow });
 		pi.sendMessage(
 			{
 				customType: "compact-forewarn-reminder",
-				content: buildReminder(marginTokens, usage.tokens, usage.contextWindow),
+				content: buildReminder(marginTokens),
 				display: false,
 			},
 			{ deliverAs: "steer" },
