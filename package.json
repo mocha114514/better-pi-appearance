@@ -8,9 +8,26 @@
     "url": "https://github.com/mocha114514/better-pi-appearance.git"
   },
   "description": "MPEP extensions for Pi: install from Git or use the standalone mpep directory",
-  "keywords": ["pi-package"],
-  "workspaces": ["mpep"],
+  "keywords": [
+    "pi-package"
+  ],
+  "workspaces": [
+    "mpep"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
   "pi": {
-    "extensions": ["./mpep"]
+    "extensions": [
+      "./mpep"
+    ]
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "^0.85.1",
+    "@earendil-works/pi-coding-agent": "^0.85.1",
+    "@earendil-works/pi-tui": "^0.85.1",
+    "@types/node": "^26.6.2",
+    "typebox": "^1.3.34",
+    "typescript": "^7.0.2"
   }
 }

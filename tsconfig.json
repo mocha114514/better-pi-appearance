@@ -1,0 +1,22 @@
+{
+  // Type-check only config for the MPEP extension sources.
+  // Mirrors the upstream Pi repo's base settings (reference-codebase/pi/tsconfig.base.json),
+  // minus emit-related options since extensions ship as raw .ts and are never compiled here.
+  "compilerOptions": {
+    "target": "ES2023",
+    "module": "Node16",
+    "moduleResolution": "Node16",
+    "lib": ["ES2023"],
+    "strict": true,
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "resolveJsonModule": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "useDefineForClassFields": false,
+    "types": ["node"]
+  },
+  "include": ["mpep/**/*.ts"],
+  "exclude": ["node_modules", "reference-codebase", "vb-temporary", "vb-test"]
+}
