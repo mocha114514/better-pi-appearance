@@ -215,7 +215,7 @@ export function sealActiveGroup(): void {
 }
 
 function ensureActiveGroup(state: MessageState): TurnState {
-	if (!activeGroup || !state.parts.some((part) => part.type === "group" && part.groupId === activeGroup?.id)) {
+	if (!activeGroup) {
 		activeGroup = {
 			id: ++nextGroupId,
 			tools: new Map(),
