@@ -2,7 +2,7 @@ import { t } from "./shared/i18n/index.ts";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const WIDGET_KEY = "fullscreen-scroll";
-const SCROLL_LINES = 3;
+const SCROLL_LINES = 5;
 
 export default function fullscreenScroll(pi: ExtensionAPI): void {
 	let dispose: (() => void) | undefined;
