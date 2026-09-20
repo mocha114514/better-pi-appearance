@@ -61,7 +61,8 @@ function buildReminder(marginTokens: number): string {
 		`1. If you see this notice while at a clean task boundary (an old task has ended, a new one is starting) or a milestone, call \`${TOOL_NAME}\` immediately before proceeding.`,
 		"2. Take stock of the current situation and make a brief plan.",
 		"3. Finish the locally coherent unit of work you are in the middle of, so nothing atomic gets cut in half.",
-		`4. As soon as that unit of work is complete, proactively call the \`${TOOL_NAME}\` tool to trigger the compaction.`,
+		`4. Before calling \`${TOOL_NAME}\`, state your completed progress and upcoming tasks in your response text, and pass upcoming tasks into the \`next_steps\` parameter of \`${TOOL_NAME}\`.`,
+		`5. Proactively call \`${TOOL_NAME}\` to trigger compaction. Once compaction finishes, you will be automatically resumed to continue your remaining work seamlessly.`,
 		`If you are not in the middle of anything that needs continuity, call \`${TOOL_NAME}\` right away.`,
 		"</system-reminder>",
 	].join("\n");
@@ -108,10 +109,17 @@ export default function compactForewarn(pi: ExtensionAPI): void {
 		description:
 			"Trigger context compaction. Only callable after the environment has issued a compaction forewarning " +
 			"(<system-reminder> about the approaching context limit); calls made before that forewarning fail. " +
-			"Compaction runs asynchronously after this call returns.",
+			"Compaction runs asynchronously and you will be automatically resumed once compaction finishes.",
 		promptSnippet: "trigger context compaction once the forewarning asks you to wrap up",
-		parameters: Type.Object({}),
-		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+		parameters: Type.Object({
+			next_steps: Type.Optional(
+				Type.String({
+					description:
+						"Brief summary of remaining tasks and upcoming plans to preserve into the compaction summary and resume afterwards.",
+				}),
+			),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			if (!armed) {
 				throw new Error(
 					`${TOOL_NAME} is locked: no compaction forewarning has been issued yet. ` +
@@ -125,13 +133,34 @@ export default function compactForewarn(pi: ExtensionAPI): void {
 				};
 			}
 			pending = true;
-			// compact() is fire-and-forget; onError re-arms the tool so the model may retry.
-			ctx.compact({ onError: () => { pending = false; } });
+
+			const nextSteps = (params as { next_steps?: string }).next_steps?.trim();
+			const customInstructions = nextSteps
+				? `Prioritize preserving the current progress and these remaining tasks: ${nextSteps}`
+				: undefined;
+
+			// compact() runs asynchronously; onComplete automatically resumes the agent
+			// so the model seamlessly continues its remaining tasks after compaction.
+			// onError re-arms the tool so the model may retry.
+			ctx.compact({
+				customInstructions,
+				onComplete: () => {
+					pending = false;
+					pi.sendUserMessage(
+						"[System Notice: Context compaction has completed successfully. " +
+							"Please review your previous plan and resume your remaining work seamlessly.]",
+						{ deliverAs: "followUp" },
+					);
+				},
+				onError: () => {
+					pending = false;
+				},
+			});
 			return {
 				content: [{
 					type: "text",
 					text: "Compaction has been triggered and is now running asynchronously. " +
-						"Your context will be compacted before the next steps; no further action is required from you.",
+						"Your context will be compacted and you will be automatically resumed to continue your work.",
 				}],
 				details: {},
 			};
