@@ -178,4 +178,10 @@ export const en = {
   "forewarn.current": "Pre-compaction forewarn margin: {tokens} tokens.",
   "forewarn.set": "Pre-compaction forewarn margin set to {tokens} tokens.",
   "forewarn.invalid": "Invalid argument. Usage: /m-ask [tokens] (positive integer)",
+  "plugin.compact-forewarn.name": "Pre-compaction Forewarning (/m-ask)",
+  "plugin.compact-forewarn.desc": "Injects an early notice before context compaction so the AI can finish atomic tasks and trigger compaction on its own",
+  "plugin.stderr-guard.name": "Library stderr Output Guard (/m-stderr)",
+  "plugin.stderr-guard.desc": "Intercepts raw library stderr writes to prevent TUI screen tearing, shows a 10s toast alert, and provides an interactive terminal log modal",
+  "stderr.commandDesc": "View intercepted third-party library stderr logs in a terminal modal",
+  "stderr.empty": "No stderr output has been captured. System is clean.",
 } as const;

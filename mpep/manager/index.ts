@@ -5,7 +5,7 @@ import { disablePathLinkHyperlinks, enablePathLinkHyperlinks } from "../path-lin
 import { installTheme, uninstallTheme } from "../theme-distributor.ts";
 
 // Registry IDs and fallback metadata stay compatible with existing installations.
-const builtinIds = ["turn-fold", "markdown-enhancer", "path-links", "terminal-interaction", "turn-navigator", "cooking-timer", "statusline", "tps", "usage", "export", "theme-distributor"] as const;
+const builtinIds = ["turn-fold", "markdown-enhancer", "path-links", "terminal-interaction", "turn-navigator", "cooking-timer", "statusline", "tps", "turn-notify", "usage", "export", "theme-distributor", "compact-forewarn", "stderr-guard"] as const;
 
 // Lifecycle hooks: some plugins own files outside mpep-cache and must clean up
 // (or set up) when toggled, instead of just self-gating on next load.

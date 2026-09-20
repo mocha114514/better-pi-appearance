@@ -89,5 +89,12 @@
     "path": "./export/index.ts",
     "desc": "把当前会话导出为单文件交互式 HTML：沿用终端折叠风格，含压缩前历史、目录与搜索",
     "enabled": true
+  },
+  {
+    "id": "stderr-guard",
+    "name": "第三方库输出防穿透与日志弹窗 (/m-stderr)",
+    "path": "./stderr-guard/index.ts",
+    "desc": "拦截第三方库向 stderr 的裸文本输出，防止破坏 TUI 排版；右上角 10 秒倒计时提示，点击展开终端日志浏览器",
+    "enabled": true
   }
 ]
