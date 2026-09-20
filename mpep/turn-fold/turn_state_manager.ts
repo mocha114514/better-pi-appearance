@@ -11,6 +11,7 @@ import type {
 	CustomEntryRecord,
 	CustomMessageRecord,
 	MessageState,
+	NotificationRecord,
 	ToolView,
 	TurnState,
 } from "./extension_types.ts";
@@ -24,12 +25,37 @@ export const customClaims = new Map<string, CustomMessageRecord>();
 export const customEntryClaims = new Map<string, CustomEntryRecord>();
 export const liveState = { globalExpanded: false };
 
+export interface PendingActivity {
+	activity: Activity;
+	group?: TurnState;
+	onBind?: (group: TurnState) => void;
+}
+
 let messages = new WeakMap<AssistantMessage, MessageState>();
 const timestamps = new Map<number, MessageState[]>();
 let activeMessage: MessageState | undefined;
 let activeGroup: TurnState | undefined;
+let pendingActivities: PendingActivity[] = [];
+let isRunActive = false;
 let nextMessageId = 0;
 let nextGroupId = 0;
+
+export function markRunStart(): void {
+	isRunActive = true;
+}
+
+export function markRunEnd(): void {
+	isRunActive = false;
+	pendingActivities = [];
+}
+
+export function isAgentRunActive(): boolean {
+	return isRunActive;
+}
+
+export function hasPendingActivities(): boolean {
+	return pendingActivities.length > 0;
+}
 
 export function resetTurnState(): void {
 	resetProcessFolds();
@@ -40,6 +66,8 @@ export function resetTurnState(): void {
 	timestamps.clear();
 	customClaims.clear();
 	customEntryClaims.clear();
+	pendingActivities = [];
+	isRunActive = false;
 	activeMessage = undefined;
 	activeGroup = undefined;
 	nextMessageId = 0;
@@ -81,17 +109,33 @@ export function observeCustomMessage(message: {
 	display?: boolean;
 	timestamp?: number;
 }): boolean {
-	if (message.display === false || !activeGroup) return false;
-	const group = activeGroup;
+	if (message.display === false) return false;
+	if (activeGroup) {
+		const group = activeGroup;
+		const record: CustomMessageRecord = {
+			type: "custom",
+			key: customMessageKey(message.customType, message.timestamp),
+			label: message.customType ?? "custom",
+			refresh: () => group.refresh?.(),
+		};
+		group.activities.push(record);
+		customClaims.set(record.key, record);
+		group.refresh?.();
+		return true;
+	}
+	if (!isRunActive) return false;
 	const record: CustomMessageRecord = {
 		type: "custom",
 		key: customMessageKey(message.customType, message.timestamp),
 		label: message.customType ?? "custom",
-		refresh: () => group.refresh?.(),
 	};
-	group.activities.push(record);
 	customClaims.set(record.key, record);
-	group.refresh?.();
+	pendingActivities.push({
+		activity: record,
+		onBind: (group) => {
+			record.refresh = () => group.refresh?.();
+		},
+	});
 	return true;
 }
 
@@ -100,16 +144,31 @@ export function observeCustomMessage(message: {
  * archival entries simply never bind a view and stay invisible inside the fold.
  */
 export function observeCustomEntry(entry: { id?: string }): boolean {
-	if (!entry.id || !activeGroup) return false;
-	const group = activeGroup;
+	if (!entry.id) return false;
+	if (activeGroup) {
+		const group = activeGroup;
+		const record: CustomEntryRecord = {
+			type: "customEntry",
+			id: entry.id,
+			refresh: () => group.refresh?.(),
+		};
+		group.activities.push(record);
+		customEntryClaims.set(record.id, record);
+		group.refresh?.();
+		return true;
+	}
+	if (!isRunActive) return false;
 	const record: CustomEntryRecord = {
 		type: "customEntry",
 		id: entry.id,
-		refresh: () => group.refresh?.(),
 	};
-	group.activities.push(record);
 	customEntryClaims.set(record.id, record);
-	group.refresh?.();
+	pendingActivities.push({
+		activity: record,
+		onBind: (group) => {
+			record.refresh = () => group.refresh?.();
+		},
+	});
 	return true;
 }
 
@@ -121,17 +180,30 @@ export function hasActiveGroup(): boolean {
 /**
  * Fold an info-level extension notification (ctx.ui.notify) into the active group.
  * The delegate view is built by notify_capture from the suppressed status components.
- * Returns the owning group and the pushed record so the caller can evict them again
- * if Pi later rewrites the suppressed line while no group is collecting; returns
- * undefined while idle so the caller leaves the status line rendered in place.
+ * When the agent is mid-run but activeGroup is not yet instantiated (e.g. during
+ * the "context" phase before the LLM streams any response), the activity is queued
+ * as pending and bound as soon as the assistant message begins.
  */
-export function observeNotification(view: Component): { group: TurnState; activity: Activity } | undefined {
-	if (!activeGroup) return undefined;
-	const group = activeGroup;
-	const activity: Activity = { type: "notification", view, refresh: () => group.refresh?.() };
-	group.activities.push(activity);
-	group.refresh?.();
-	return { group, activity };
+export function observeNotification(
+	view: Component,
+	onBind?: (group: TurnState) => void,
+): { group?: TurnState; activity: Activity } | undefined {
+	if (activeGroup) {
+		const group = activeGroup;
+		const activity: Activity = { type: "notification", view, refresh: () => group.refresh?.() };
+		group.activities.push(activity);
+		group.refresh?.();
+		return { group, activity };
+	}
+	if (!isRunActive) return undefined;
+	const activity: NotificationRecord = { type: "notification", view };
+	const holder: PendingActivity = {
+		activity,
+		onBind,
+	};
+	activity.refresh = () => holder.group?.refresh?.();
+	pendingActivities.push(holder);
+	return { activity };
 }
 
 export function sealActiveGroup(): void {
@@ -140,6 +212,21 @@ export function sealActiveGroup(): void {
 	if (!group) return;
 	group.sealed = true;
 	group.refresh?.();
+}
+
+function ensureActiveGroup(state: MessageState): TurnState {
+	if (!activeGroup || !state.parts.some((part) => part.type === "group" && part.groupId === activeGroup?.id)) {
+		activeGroup = {
+			id: ++nextGroupId,
+			tools: new Map(),
+			activities: [],
+			expanded: liveState.globalExpanded,
+			sealed: false,
+		};
+		turnStates.set(activeGroup.id, activeGroup);
+		state.parts.push({ type: "group", groupId: activeGroup.id });
+	}
+	return activeGroup;
 }
 
 /** Only protocol events allocate groups. Rendering never changes activity ownership. */
@@ -156,6 +243,19 @@ export function observeAssistant(message: AssistantMessage, start = false): void
 	state.message = message;
 	activeMessage = state;
 	const changed = new Set<TurnState>();
+
+	// Flush any activities (e.g. notifications, custom entries) that arrived before the first token.
+	if (pendingActivities.length > 0) {
+		const group = ensureActiveGroup(state);
+		for (const pending of pendingActivities) {
+			pending.group = group;
+			pending.onBind?.(group);
+			group.activities.push(pending.activity);
+		}
+		pendingActivities = [];
+		changed.add(group);
+	}
+
 	for (let index = 0; index < message.content.length; index++) {
 		const block = message.content[index];
 		const existing = state.blocks.get(index);
@@ -180,18 +280,7 @@ export function observeAssistant(message: AssistantMessage, start = false): void
 			}
 			continue;
 		}
-		if (!activeGroup) {
-			activeGroup = {
-				id: ++nextGroupId,
-				tools: new Map(),
-				activities: [],
-				expanded: liveState.globalExpanded,
-				sealed: false,
-			};
-			turnStates.set(activeGroup.id, activeGroup);
-			state.parts.push({ type: "group", groupId: activeGroup.id });
-		}
-		const group = activeGroup;
+		const group = ensureActiveGroup(state);
 		if (block.type === "thinking") {
 			const activity = {
 				type: "thinking" as const,
@@ -263,6 +352,7 @@ export function endLiveCollection(): void {
 		}
 		if (changed) group.refresh?.();
 	}
+	markRunEnd();
 	sealActiveGroup();
 	activeMessage = undefined;
 	completeProcessFolds();
@@ -361,16 +451,25 @@ function claimHistoryCustomMessage(
 	index: number,
 ): boolean {
 	const custom = entry as { display?: boolean; customType?: string; timestamp?: string };
-	if (custom.display === false || !activeGroup || !hasFollowingAssistant(entries, index)) return false;
-	const group = activeGroup;
+	if (custom.display === false || !hasFollowingAssistant(entries, index)) return false;
 	const record: CustomMessageRecord = {
 		type: "custom",
 		key: customMessageKey(custom.customType, Date.parse(custom.timestamp ?? "") || 0),
 		label: custom.customType ?? "custom",
-		refresh: () => group.refresh?.(),
 	};
-	group.activities.push(record);
 	customClaims.set(record.key, record);
+	if (activeGroup) {
+		const group = activeGroup;
+		record.refresh = () => group.refresh?.();
+		group.activities.push(record);
+	} else {
+		pendingActivities.push({
+			activity: record,
+			onBind: (group) => {
+				record.refresh = () => group.refresh?.();
+			},
+		});
+	}
 	return true;
 }
 
@@ -380,15 +479,24 @@ function claimHistoryCustomEntry(
 	index: number,
 ): boolean {
 	const custom = entry as { id?: string };
-	if (!custom.id || !activeGroup || !hasFollowingAssistant(entries, index)) return false;
-	const group = activeGroup;
+	if (!custom.id || !hasFollowingAssistant(entries, index)) return false;
 	const record: CustomEntryRecord = {
 		type: "customEntry",
 		id: custom.id,
-		refresh: () => group.refresh?.(),
 	};
-	group.activities.push(record);
 	customEntryClaims.set(record.id, record);
+	if (activeGroup) {
+		const group = activeGroup;
+		record.refresh = () => group.refresh?.();
+		group.activities.push(record);
+	} else {
+		pendingActivities.push({
+			activity: record,
+			onBind: (group) => {
+				record.refresh = () => group.refresh?.();
+			},
+		});
+	}
 	return true;
 }
 

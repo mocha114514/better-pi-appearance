@@ -3,7 +3,7 @@ import { isPluginEnabled } from "../manager/preferences.ts";
 import { registerBuiltInTools } from "./builtin_tools_override.ts";
 import { orderedSessionEntries } from "./compaction_placement.ts";
 import { installEntryCapture, reconcileEntryClaims, resetEntryCapture } from "./entry_capture.ts";
-import { installNotifyCapture } from "./notify_capture.ts";
+import { installNotifyCapture, releasePendingNotifications } from "./notify_capture.ts";
 import { completeProcessFolds } from "./process_fold_state.ts";
 import { applyPatches } from "./core_components_patcher.ts";
 import { setupMcpCoordinator } from "./mcp_tools_coordinator.ts";
@@ -14,6 +14,7 @@ import { setLatestTheme } from "./summary_preview_renderer.ts";
 import {
 	endLiveCollection,
 	finishAssistant,
+	markRunStart,
 	observeAssistant,
 	observeCustomMessage,
 	observeToolResult,
@@ -36,12 +37,16 @@ export default function (pi: ExtensionAPI): void {
 		setLatestTheme(ctx.ui.theme);
 		// Fold state must mirror what Pi paints, not the raw branch: see orderedSessionEntries.
 		resetEntryCapture();
+		releasePendingNotifications();
 		syncFromSessionHistory(orderedSessionEntries(ctx.sessionManager), !ctx.isIdle());
 		reconcileEntryClaims();
 	};
 	pi.on("session_start", restoreSession);
 	pi.on("session_compact", restoreSession);
 	pi.on("session_tree", restoreSession);
+	pi.on("before_agent_start", markRunStart);
+	pi.on("agent_start", markRunStart);
+	pi.on("turn_start", markRunStart);
 	pi.on("message_start", (event) => {
 		if (event.message.role === "assistant") observeAssistant(event.message, true);
 		else if (event.message.role === "custom") {
@@ -69,7 +74,10 @@ export default function (pi: ExtensionAPI): void {
 	});
 	pi.on("tool_execution_update", (event) => observeToolResult(event.toolCallId, event.partialResult, true, false));
 	pi.on("tool_execution_end", (event) => observeToolResult(event.toolCallId, event.result, false, event.isError));
-	pi.on("agent_end", endLiveCollection);
+	pi.on("agent_end", () => {
+		endLiveCollection();
+		releasePendingNotifications();
+	});
 	pi.on("session_shutdown", () => {
 		disposePatches();
 		disposeEntryCapture();

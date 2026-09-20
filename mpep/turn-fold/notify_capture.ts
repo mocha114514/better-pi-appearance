@@ -1,6 +1,6 @@
 import { InteractiveMode } from "@earendil-works/pi-coding-agent";
 import type { Component } from "@earendil-works/pi-tui";
-import { hasActiveGroup, observeNotification } from "./turn_state_manager.ts";
+import { hasActiveGroup, hasPendingActivities, observeNotification } from "./turn_state_manager.ts";
 import type { Activity, TurnState } from "./extension_types.ts";
 
 /**
@@ -37,12 +37,14 @@ interface ChatHost {
 interface CapturedBatch {
 	components: Component[];
 	originals: Component["render"][];
-	group: TurnState;
+	group?: TurnState;
 	record: Activity;
 }
 
 /** Suppressed batches keyed by their trailing (text) component — the rewrite target. */
 const suppressed = new Map<Component, CapturedBatch>();
+/** Suppressed batches waiting for an active group to bind to. */
+const pendingBatches = new Set<CapturedBatch>();
 
 const patchSlot = Symbol.for("mpep.turn-fold.notify-capture");
 const patches = globalThis as unknown as Record<symbol, (() => void) | undefined>;
@@ -53,9 +55,23 @@ function release(batch: CapturedBatch): void {
 		batch.components[index].render = batch.originals[index];
 		suppressed.delete(batch.components[index]);
 	}
-	const index = batch.group.activities.indexOf(batch.record);
-	if (index >= 0) batch.group.activities.splice(index, 1);
-	batch.group.refresh?.();
+	pendingBatches.delete(batch);
+	if (batch.group) {
+		const index = batch.group.activities.indexOf(batch.record);
+		if (index >= 0) batch.group.activities.splice(index, 1);
+		batch.group.refresh?.();
+	}
+}
+
+/** Release pending notification batches whose run ended without creating an assistant host. */
+export function releasePendingNotifications(): void {
+	for (const batch of pendingBatches) {
+		for (let index = 0; index < batch.components.length; index++) {
+			batch.components[index].render = batch.originals[index];
+			suppressed.delete(batch.components[index]);
+		}
+	}
+	pendingBatches.clear();
 }
 
 export function installNotifyCapture(): () => void {
@@ -73,7 +89,7 @@ export function installNotifyCapture(): () => void {
 			// Back-to-back de-dup: Pi rewrote the last status Text in place. Mid-run the
 			// delegate view follows the rewrite on its own; without an active group we
 			// must hand the line back to the chat or the rewrite would stay invisible.
-			if (hasActiveGroup()) return;
+			if (hasActiveGroup() || hasPendingActivities() || pendingBatches.size > 0) return;
 			const last = children[children.length - 1] as Component | undefined;
 			const batch = last ? suppressed.get(last) : undefined;
 			if (batch) release(batch);
@@ -88,10 +104,19 @@ export function installNotifyCapture(): () => void {
 				for (const component of added) component.invalidate();
 			},
 		};
-		// Idle (no active group): leave the status line rendered in place.
-		const record = observeNotification(view);
+
+		let batch!: CapturedBatch;
+		const record = observeNotification(view, (group) => {
+			batch.group = group;
+			pendingBatches.delete(batch);
+		});
+		// Idle (no active group and no active run): leave the status line rendered in place.
 		if (!record) return;
-		const batch: CapturedBatch = { components: added, originals, group: record.group, record: record.activity };
+
+		batch = { components: added, originals, group: record.group, record: record.activity };
+		if (!record.group) {
+			pendingBatches.add(batch);
+		}
 		for (const component of added) {
 			component.render = () => [];
 			suppressed.set(component, batch);
@@ -101,6 +126,7 @@ export function installNotifyCapture(): () => void {
 
 	const dispose = () => {
 		if (modePrototype.showStatus === showStatus) modePrototype.showStatus = originalShowStatus;
+		releasePendingNotifications();
 		suppressed.clear();
 		if (patches[patchSlot] === dispose) delete patches[patchSlot];
 	};
