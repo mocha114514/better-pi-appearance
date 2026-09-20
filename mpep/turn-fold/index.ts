@@ -52,9 +52,10 @@ export default function (pi: ExtensionAPI): void {
 				sealActiveGroup();
 				completeProcessFolds();
 			}
-		} else if (event.message.role !== "toolResult") {
+		} else if (event.message.role !== "toolResult" && (event.message.role as string) !== "system") {
 			sealActiveGroup();
 			// Steering / follow-ups close the previous disclosure immediately, not at agent_end.
+			// System messages carry internal prompt/tool state changes and must not split turns.
 			completeProcessFolds();
 		}
 	});

@@ -321,6 +321,10 @@ export function syncFromSessionHistory(
 		} else if (entry.message.role === "toolResult") {
 			const result = entry.message as ToolResultMessage;
 			observeToolResult(result.toolCallId, result, false, result.isError);
+		} else if (entry.message.role === "system") {
+			// System messages record prompt/tool mutations (e.g. toolsRemoved/toolsAdded)
+			// and do not render or act as turn boundaries.
+			continue;
 		} else {
 			sealActiveGroup();
 			completeProcessFolds();
@@ -345,7 +349,7 @@ function hasFollowingAssistant(
 		if (next.type === "custom_message" || next.type === "custom") continue;
 		if (next.type !== "message") continue;
 		const role = (next.message as { role?: string } | undefined)?.role;
-		if (role === "toolResult") continue;
+		if (role === "toolResult" || role === "system") continue;
 		return role === "assistant";
 	}
 	return false;
