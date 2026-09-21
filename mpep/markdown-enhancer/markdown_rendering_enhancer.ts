@@ -729,8 +729,8 @@ export function applyMathPatch(): () => void {
 				}
 
 				const isRendered = Boolean(rendered);
-				const displayText = (rendered ?? rawMath).trim();
-				const rawLines = displayText.split("\n");
+				const rawLines = (rendered ?? rawMath).trimEnd().split("\n");
+				while (rawLines.length > 0 && rawLines[0].trim() === "") rawLines.shift();
 
 				const lines: string[] = [];
 				const border = (text: string) => (this.theme.codeBlockBorder ? this.theme.codeBlockBorder(text) : text);
