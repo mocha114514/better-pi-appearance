@@ -17,7 +17,7 @@
     "id": "markdown-enhancer",
     "name": "Markdown 渲染美化",
     "path": "./markdown-enhancer/index.ts",
-    "desc": "圆角代码块、排版级列表符号、加粗强调增强与 callout/标题/符号转换",
+    "desc": "圆角代码块、排版级列表符号、数学公式卡片美化与 callout/标题/符号转换",
     "enabled": true
   },
   {

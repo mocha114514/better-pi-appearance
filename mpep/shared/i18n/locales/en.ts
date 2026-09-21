@@ -36,7 +36,7 @@ export const en = {
   "plugin.turn-fold.name": "Turn folding and compact output",
   "plugin.turn-fold.desc": "Compact activity counts, expandable details, cursor protection and MCP counts",
   "plugin.markdown-enhancer.name": "Markdown rendering enhancements",
-  "plugin.markdown-enhancer.desc": "Rounded code blocks, typographic list bullets, bold emphasis lift and callout/heading/symbol transforms",
+  "plugin.markdown-enhancer.desc": "Rounded code blocks, typographic list bullets, math formula card styling, and callout/heading/symbol transforms",
   "plugin.path-links.name": "Path short-links",
   "plugin.path-links.desc": "Also enables terminal hyperlinks. Collapses file paths to underlined short names; hover shows the full path; click opens complete paths",
   "plugin.terminal-interaction.name": "Terminal editor interaction enhancements",

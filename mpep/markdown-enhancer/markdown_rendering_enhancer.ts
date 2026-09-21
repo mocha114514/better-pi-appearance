@@ -3,7 +3,7 @@
 // can be toggled independently via the markdown-enhancer plugin entry.
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Markdown, type MarkdownTheme, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { Markdown, type MarkdownTheme, renderLatex, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 
 const patchSlot = Symbol.for("mpep.markdown-enhancer.markdown-patches");
 const patches = globalThis as unknown as Record<symbol, (() => void) | undefined>;
@@ -443,11 +443,17 @@ export function applyTablePatch(): () => void {
 }
 
 /**
+ * Protected inline segments: code spans (`...`), dollar math ($...$),
+ * and parenthesized LaTeX math (\(...\)).
+ */
+const INLINE_PROTECTED_PATTERN = /(`[^`]*`|\$(?:\\.|[^$\\\n])+\$|\\\([\s\S]*?\\\))/g;
+
+/**
  * Replace ASCII symbols with typographic Unicode characters,
- * strictly skipping inline code blocks wrapped in backticks.
+ * strictly skipping inline code blocks and math expressions.
  */
 function enhanceInlineSymbols(text: string): string {
-	const segments = text.split(/(`[^`]*`)/g);
+	const segments = text.split(INLINE_PROTECTED_PATTERN);
 
 	for (let i = 0; i < segments.length; i += 2) {
 		let seg = segments[i];
@@ -544,11 +550,11 @@ const BOLD_BRACKET_PATTERNS = BOLD_BRACKET_PAIRS.map(([open, close]) => {
 
 /**
  * Clean up accidental spaces inside bold markers (e.g. `** text **` -> `**text**`),
- * strictly preserving inline code spans wrapped in backticks.
+ * strictly preserving inline code spans and math expressions.
  */
 function enhanceBoldSyntax(text: string): string {
 	if (!text.includes("**")) return text;
-	const segments = text.split(/(`[^`]*`)/g);
+	const segments = text.split(INLINE_PROTECTED_PATTERN);
 
 	for (let i = 0; i < segments.length; i += 2) {
 		let seg = segments[i];
@@ -663,9 +669,184 @@ export function applyHeadingPatch(): () => void {
 }
 
 /**
+ * Sanitize non-standard or unsupported LaTeX expressions that cause
+ * Pi's native renderLatex parser to fail.
+ */
+export function cleanLatex(source: string): string {
+	let text = source;
+	// 1. Strip LaTeX comments (% to end of line), keeping escaped \% intact
+	text = text.replace(/(^|[^\\])%.*$/gm, "$1");
+	// 2. Strip \label{...} and \ref{...}
+	text = text.replace(/\\(?:label|ref)\{[^}]*\}/g, "");
+	// 3. Convert \tag{...} to parenthesized annotation
+	text = text.replace(/\\tag\{([^}]*)\}/g, "\\quad ($1)");
+	// 4. Unwrap \color{...}{content} and \textcolor{...}{content}
+	text = text.replace(/\\(?:text)?color\{[^}]*\}\{([^}]*)\}/g, "$1");
+	// 5. Convert \bm{...} to \mathbf{...}
+	text = text.replace(/\\bm\{([^}]*)\}/g, "\\mathbf{$1}");
+	// 6. Convert TeX 1.0 font switches: {\rm ...}, {\bf ...}, {\it ...}, {\sf ...}, {\tt ...}
+	text = text.replace(/\{\\rm\s+([^}]*)\}/g, "\\mathrm{$1}");
+	text = text.replace(/\{\\bf\s+([^}]*)\}/g, "\\mathbf{$1}");
+	text = text.replace(/\{\\it\s+([^}]*)\}/g, "\\mathit{$1}");
+	text = text.replace(/\{\\sf\s+([^}]*)\}/g, "\\mathsf{$1}");
+	text = text.replace(/\{\\tt\s+([^}]*)\}/g, "\\mathtt{$1}");
+	// 7. Convert eqnarray to aligned
+	text = text
+		.replace(/\\begin\{eqnarray\*?\}/g, "\\begin{aligned}")
+		.replace(/\\end\{eqnarray\*?\}/g, "\\end{aligned}")
+		.replace(/&=&/g, "&=");
+	// 8. Normalize \newline to \\
+	text = text.replace(/\\newline\b/g, "\\\\");
+	// 9. Strip harmless unrendered directives
+	text = text.replace(/\\(?:notag|nonumber|displaybreak)\b/g, "");
+	return text.trim();
+}
+
+/**
+ * Patch Markdown.prototype.renderToken and Markdown.prototype.renderInlineTokens
+ * to render mathematical formulas with dedicated card borders, soft styling, and robust error recovery.
+ */
+export function applyMathPatch(): () => void {
+	const proto = Markdown.prototype as any;
+	let active = true;
+
+	const originalRenderToken = proto.renderToken;
+	const originalRenderInlineTokens = proto.renderInlineTokens;
+
+	// 1. Intercept block-level LaTeX math: token.type === "latexBlock"
+	proto.renderToken = function (token: any, width: number, nextTokenType?: string, styleContext?: any): string[] {
+		if (active && token?.type === "latexBlock") {
+			if (token.pending || width < 10) {
+				return originalRenderToken.call(this, token, width, nextTokenType, styleContext);
+			}
+
+			try {
+				const rawMath = token.text ?? "";
+				const cleaned = cleanLatex(rawMath);
+				let rendered = renderLatex(cleaned, { display: true });
+				if (!rendered && cleaned !== rawMath) {
+					rendered = renderLatex(rawMath, { display: true });
+				}
+
+				const isRendered = Boolean(rendered);
+				const displayText = (rendered ?? rawMath).trim();
+				const rawLines = displayText.split("\n");
+
+				const lines: string[] = [];
+				const border = (text: string) => (this.theme.codeBlockBorder ? this.theme.codeBlockBorder(text) : text);
+				const innerWidth = Math.max(1, width - 4);
+				const displayTitle = isRendered ? " ∑ math " : " ∑ math (raw) ";
+				const titleWidth = visibleWidth(displayTitle);
+				const minHeaderWidth = 3 + titleWidth;
+
+				let topHeader: string;
+				if (titleWidth > 0 && width >= minHeaderWidth) {
+					const fill = width - minHeaderWidth;
+					const styledTitle = border(`\x1b[38;5;117m${displayTitle}\x1b[0m`);
+					topHeader = border("╭─") + styledTitle + border("─".repeat(fill) + "╮");
+				} else {
+					topHeader = border("╭" + "─".repeat(Math.max(0, width - 2)) + "╮");
+				}
+				lines.push(topHeader);
+
+				const mathTextColor = (line: string) => `\x1b[38;5;153m${line}\x1b[0m`;
+
+				for (const rawLine of rawLines) {
+					const styled = isRendered ? mathTextColor(rawLine) : rawLine;
+					const wrapped = wrapTextWithAnsi(styled, innerWidth);
+					if (wrapped.length === 0) {
+						lines.push(border("│ ") + " ".repeat(innerWidth) + border(" │"));
+					} else {
+						for (const subLine of wrapped) {
+							const padLen = Math.max(0, innerWidth - visibleWidth(subLine));
+							lines.push(border("│ ") + subLine + " ".repeat(padLen) + border(" │"));
+						}
+					}
+				}
+
+				lines.push(border("╰" + "─".repeat(Math.max(0, width - 2)) + "╯"));
+
+				if (nextTokenType && nextTokenType !== "space") {
+					lines.push("");
+				}
+
+				return lines;
+			} catch {
+				return originalRenderToken.call(this, token, width, nextTokenType, styleContext);
+			}
+		}
+
+		return originalRenderToken.call(this, token, width, nextTokenType, styleContext);
+	};
+
+	// 2. Intercept inline LaTeX math: token.type === "latex"
+	proto.renderInlineTokens = function (tokens: any[], styleContext?: any): string {
+		if (!active || !tokens || !tokens.some((t: any) => t.type === "latex")) {
+			return originalRenderInlineTokens.call(this, tokens, styleContext);
+		}
+
+		try {
+			const resolvedStyleContext = styleContext ?? this.getDefaultInlineStyleContext();
+			const { stylePrefix } = resolvedStyleContext;
+
+			let result = "";
+			let nonLatexRun: any[] = [];
+
+			const flush = () => {
+				if (nonLatexRun.length > 0) {
+					result += originalRenderInlineTokens.call(this, nonLatexRun, styleContext);
+					nonLatexRun = [];
+				}
+			};
+
+			for (const token of tokens) {
+				if (token.type !== "latex") {
+					nonLatexRun.push(token);
+					continue;
+				}
+
+				flush();
+				const latexToken = token;
+				if (latexToken.pending) {
+					result += latexToken.raw;
+					continue;
+				}
+
+				const rawMath = latexToken.text ?? "";
+				const cleaned = cleanLatex(rawMath);
+				let rendered = renderLatex(cleaned, { display: false });
+				if (!rendered && cleaned !== rawMath) {
+					rendered = renderLatex(rawMath, { display: false });
+				}
+
+				if (rendered) {
+					result += `\x1b[3m\x1b[38;5;153m${rendered}\x1b[0m` + stylePrefix;
+				} else {
+					result += latexToken.raw;
+				}
+			}
+
+			flush();
+			return result;
+		} catch {
+			return originalRenderInlineTokens.call(this, tokens, styleContext);
+		}
+	};
+
+	const installedRenderToken = proto.renderToken;
+	const installedRenderInlineTokens = proto.renderInlineTokens;
+
+	return () => {
+		active = false;
+		if (proto.renderToken === installedRenderToken) proto.renderToken = originalRenderToken;
+		if (proto.renderInlineTokens === installedRenderInlineTokens) proto.renderInlineTokens = originalRenderInlineTokens;
+	};
+}
+
+/**
  * Setup Markdown enhancements:
- * - Prototype patches on Markdown component (lists, code blocks, tables, headings, bold text)
- * - Markdown transformer registration (callouts, headings, bold syntax, inline symbols)
+ * - Prototype patches on Markdown component (lists, code blocks, tables, headings, bold text, math formulas)
+ * - Markdown transformer registration (callouts, headings, bold syntax, inline symbols, math protection)
  */
 export function setupMarkdownEnhancements(pi: ExtensionAPI): () => void {
 	patches[patchSlot]?.();
@@ -674,11 +855,13 @@ export function setupMarkdownEnhancements(pi: ExtensionAPI): () => void {
 	const disposeTable = applyTablePatch();
 	const disposeBold = applyBoldPatch();
 	const disposeHeading = applyHeadingPatch();
+	const disposeMath = applyMathPatch();
 	let active = true;
 	const dispose = () => {
 		if (!active) return;
 		active = false;
 		// Each patch wraps renderToken after the previous one, so unwind in reverse order.
+		disposeMath();
 		disposeHeading();
 		disposeBold();
 		disposeTable();
@@ -699,6 +882,8 @@ export function setupMarkdownEnhancements(pi: ExtensionAPI): () => void {
 
 		let inCodeBlock = false;
 		let codeBlockChar = "";
+		let inMathBlock = false;
+		let mathBlockDelimiter = "";
 
 		for (const line of lines) {
 			const fenceMatch = line.match(/^(\s*)(`{3,}|~{3,})/);
@@ -721,16 +906,52 @@ export function setupMarkdownEnhancements(pi: ExtensionAPI): () => void {
 				continue;
 			}
 
+			// Preserve block-level math ($$ ... $$ or \[ ... \])
+			const trimmed = line.trim();
+			if (!inMathBlock) {
+				// Single-line block math
+				if (/^\$\$(.*)\$\$$/.test(trimmed) && trimmed.length > 2) {
+					transformed.push(line);
+					continue;
+				}
+				if (/^\\\[(.*)\\\]$/.test(trimmed) && trimmed.length > 4) {
+					transformed.push(line);
+					continue;
+				}
+				if (trimmed.startsWith("$$")) {
+					inMathBlock = true;
+					mathBlockDelimiter = "$$";
+					transformed.push(line);
+					continue;
+				}
+				if (trimmed.startsWith("\\[")) {
+					inMathBlock = true;
+					mathBlockDelimiter = "\\]";
+					transformed.push(line);
+					continue;
+				}
+			} else {
+				if (
+					(mathBlockDelimiter === "$$" && (trimmed === "$$" || trimmed.endsWith("$$"))) ||
+					(mathBlockDelimiter === "\\]" && (trimmed === "\\]" || trimmed.endsWith("\\]")))
+				) {
+					inMathBlock = false;
+					mathBlockDelimiter = "";
+				}
+				transformed.push(line);
+				continue;
+			}
+
 			// 1. Transform callouts
 			let processed = enhanceCallouts(line);
 
 			// 2. Transform headings to avoid raw '#' display
 			processed = enhanceHeadings(processed);
 
-			// 3. Clean up loose spaces in bold markers outside inline code
+			// 3. Clean up loose spaces in bold markers outside inline code & math
 			processed = enhanceBoldSyntax(processed);
 
-			// 4. Enhance typographic symbols outside inline code
+			// 4. Enhance typographic symbols outside inline code & math
 			processed = enhanceInlineSymbols(processed);
 
 			transformed.push(processed);

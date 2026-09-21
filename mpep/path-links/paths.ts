@@ -13,6 +13,7 @@ export const PATH_HREF_PREFIX = "mpep-path:";
 const IS_WINDOWS = process.platform === "win32";
 
 const INLINE_CODE = /(`+)((?:(?!\1).|\\.)*)\1/g;
+const INLINE_MATH = /(\$(?:\\.|[^$\\\n])+\$|\\\([\s\S]*?\\\))/g;
 const MD_LINK = /!?\[(?:[^\[\]\\]|\\.)*\]\((?:<[^>]+>|[^)\s]+)(?:\s+"[^"]*")?\)/g;
 const OSC8 = /\x1b\]8;[^;]*;([^\x07\x1b]*)(?:\x07|\x1b\\)/g;
 const DATE_TOKEN = /^\d{1,4}(\/\d{1,2}){1,2}$/;
@@ -315,19 +316,29 @@ function replacementFor(token: CollapsibleToken): string {
 	return token.kind === "url" ? toWebMarkdownLink(token.text) : toMarkdownLink(token.text);
 }
 
-function splitInline(line: string): Array<{ start: number; end: number; kind: "code" | "text"; raw: string }> {
-	const segments: Array<{ start: number; end: number; kind: "code" | "text"; raw: string }> = [];
-	const codes = allMatches(line, INLINE_CODE).map((match) => ({
-		start: match.index ?? 0,
-		end: (match.index ?? 0) + match[0].length,
-	}));
-	let cursor = 0;
-	for (const code of codes) {
-		if (code.start > cursor) {
-			segments.push({ start: cursor, end: code.start, kind: "text", raw: line.slice(cursor, code.start) });
+function splitInline(line: string): Array<{ start: number; end: number; kind: "code" | "math" | "text"; raw: string }> {
+	const segments: Array<{ start: number; end: number; kind: "code" | "math" | "text"; raw: string }> = [];
+	const spans: Array<{ start: number; end: number; kind: "code" | "math" }> = [];
+
+	for (const match of allMatches(line, INLINE_CODE)) {
+		spans.push({ start: match.index ?? 0, end: (match.index ?? 0) + match[0].length, kind: "code" });
+	}
+	for (const match of allMatches(line, INLINE_MATH)) {
+		const start = match.index ?? 0;
+		const end = start + match[0].length;
+		if (!spans.some((s) => (start >= s.start && start < s.end) || (end > s.start && end <= s.end))) {
+			spans.push({ start, end, kind: "math" });
 		}
-		segments.push({ start: code.start, end: code.end, kind: "code", raw: line.slice(code.start, code.end) });
-		cursor = code.end;
+	}
+	spans.sort((a, b) => a.start - b.start);
+
+	let cursor = 0;
+	for (const span of spans) {
+		if (span.start > cursor) {
+			segments.push({ start: cursor, end: span.start, kind: "text", raw: line.slice(cursor, span.start) });
+		}
+		segments.push({ start: span.start, end: span.end, kind: span.kind, raw: line.slice(span.start, span.end) });
+		cursor = span.end;
 	}
 	if (cursor < line.length) segments.push({ start: cursor, end: line.length, kind: "text", raw: line.slice(cursor) });
 	return segments;
@@ -509,6 +520,10 @@ function transformLine(line: string): string {
 	if (!line) return line;
 	let out = "";
 	for (const segment of splitInline(line)) {
+		if (segment.kind === "math") {
+			out += segment.raw;
+			continue;
+		}
 		if (segment.kind === "code") {
 			const fence = /^(`+)([\s\S]*)\1$/.exec(segment.raw);
 			const inner = fence?.[2] ?? "";
@@ -541,6 +556,8 @@ export function transformPathMarkdown(markdown: string): string {
 	const transformed: string[] = [];
 	let inFence = false;
 	let fenceChar = "";
+	let inMathBlock = false;
+	let mathDelimiter = "";
 	for (const line of lines) {
 		const fenceMatch = line.match(/^(\s*)(`{3,}|~{3,})/);
 		if (fenceMatch) {
@@ -555,7 +572,47 @@ export function transformPathMarkdown(markdown: string): string {
 			transformed.push(line);
 			continue;
 		}
-		transformed.push(inFence ? line : normalizeExplicitLinks(separateAutolinkTails(transformLine(line))));
+		if (inFence) {
+			transformed.push(line);
+			continue;
+		}
+
+		// Preserve block-level math ($$ ... $$ or \[ ... \])
+		const trimmed = line.trim();
+		if (!inMathBlock) {
+			if (/^\$\$(.*)\$\$$/.test(trimmed) && trimmed.length > 2) {
+				transformed.push(line);
+				continue;
+			}
+			if (/^\\\[(.*)\\\]$/.test(trimmed) && trimmed.length > 4) {
+				transformed.push(line);
+				continue;
+			}
+			if (trimmed.startsWith("$$")) {
+				inMathBlock = true;
+				mathDelimiter = "$$";
+				transformed.push(line);
+				continue;
+			}
+			if (trimmed.startsWith("\\[")) {
+				inMathBlock = true;
+				mathDelimiter = "\\]";
+				transformed.push(line);
+				continue;
+			}
+		} else {
+			if (
+				(mathDelimiter === "$$" && (trimmed === "$$" || trimmed.endsWith("$$"))) ||
+				(mathDelimiter === "\\]" && (trimmed === "\\]" || trimmed.endsWith("\\]")))
+			) {
+				inMathBlock = false;
+				mathDelimiter = "";
+			}
+			transformed.push(line);
+			continue;
+		}
+
+		transformed.push(normalizeExplicitLinks(separateAutolinkTails(transformLine(line))));
 	}
 	return transformed.join("\n");
 }

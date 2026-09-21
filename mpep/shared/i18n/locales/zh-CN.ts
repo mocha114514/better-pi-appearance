@@ -37,7 +37,7 @@ export const zhCN = {
   "plugin.turn-fold.name": "对话轮次折叠与紧凑排版",
   "plugin.turn-fold.desc": "单行折叠计数、Ctrl+O/双击展开详情、细光标保护与 MCP 统一计数",
   "plugin.markdown-enhancer.name": "Markdown 渲染美化",
-  "plugin.markdown-enhancer.desc": "圆角代码块、排版级列表符号、加粗强调增强与 callout/标题/符号转换",
+  "plugin.markdown-enhancer.desc": "圆角代码块、排版级列表符号、数学公式卡片美化与 callout/标题/符号转换",
   "plugin.path-links.name": "路径短链与超链接",
   "plugin.path-links.desc": "同步开启 hyperlinks。文件路径收成主题色下划线短名，悬停显示完整路径，完整路径点击用系统打开",
   "plugin.terminal-interaction.name": "终端编辑交互增强",
