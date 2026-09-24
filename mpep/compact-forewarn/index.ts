@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { isPluginEnabled } from "../manager/preferences.ts";
@@ -18,6 +18,12 @@ import { t } from "../shared/i18n/index.ts";
  * then call the gated `request_compaction` tool. The tool errors while disarmed
  * and re-locks as soon as Pi reports the compaction (manual, threshold, or
  * overflow).
+ *
+ * The tool does not call `ctx.compact()` itself. That API always aborts an
+ * active run first, and the aborted follow-up assistant message is what the
+ * TUI paints as the red "Operation aborted" line. Instead the tool returns
+ * `terminate: true`, which ends the run normally. Compaction starts later, from
+ * `agent_settled`, when the run is already idle and abort is a no-op.
  */
 
 const COMMAND = "m-ask";
@@ -62,7 +68,7 @@ function buildReminder(marginTokens: number): string {
 		"2. Take stock of the current situation and make a brief plan.",
 		"3. Finish the locally coherent unit of work you are in the middle of, so nothing atomic gets cut in half.",
 		`4. Before calling \`${TOOL_NAME}\`, state your completed progress and upcoming tasks in your response text, and pass upcoming tasks into the \`next_steps\` parameter of \`${TOOL_NAME}\`.`,
-		`5. Proactively call \`${TOOL_NAME}\` to trigger compaction. Once compaction finishes, you will be automatically resumed to continue your remaining work seamlessly.`,
+		`5. Proactively call \`${TOOL_NAME}\` by itself, with no other tool calls in that response. The turn ends after it returns. Once compaction finishes, you will be automatically resumed to continue your remaining work seamlessly.`,
 		`If you are not in the middle of anything that needs continuity, call \`${TOOL_NAME}\` right away.`,
 		"</system-reminder>",
 	].join("\n");
@@ -72,12 +78,43 @@ export default function compactForewarn(pi: ExtensionAPI): void {
 	if (!isPluginEnabled("compact-forewarn")) return;
 
 	// Session-scoped state machine: disarmed -> armed (forewarn sent) -> disarmed
-	// (compaction observed). `pending` additionally tracks a compact() request
-	// that has been issued but not yet settled, so repeat tool calls are no-ops
-	// instead of stacking duplicate compactions.
+	// (compaction observed). `pending` means the model asked to compact and the
+	// current run must stop. `compactionStarted` means ctx.compact() was issued
+	// and has not settled yet, so a later agent_settled cannot start a second one.
 	let armed = false;
 	let pending = false;
+	let compactionStarted = false;
+	let pendingInstructions: string | undefined;
 	let marginTokens = DEFAULT_MARGIN_TOKENS;
+
+	const resetCompactionRequest = () => {
+		pending = false;
+		compactionStarted = false;
+		pendingInstructions = undefined;
+	};
+
+	// Idle-only. agent_settled is emitted after the run flag is cleared, so
+	// compact()'s internal abort does not cancel an assistant response.
+	const startQueuedCompaction = (ctx: { isIdle(): boolean; compact: ExtensionContext["compact"] }) => {
+		if (!pending || compactionStarted || !ctx.isIdle()) return;
+		compactionStarted = true;
+		const customInstructions = pendingInstructions;
+		pendingInstructions = undefined;
+		ctx.compact({
+			customInstructions,
+			onComplete: () => {
+				resetCompactionRequest();
+				pi.sendUserMessage(
+					"[System Notice: Context compaction has completed successfully. " +
+						"Please review your previous plan and resume your remaining work seamlessly.]",
+					{ deliverAs: "followUp" },
+				);
+			},
+			onError: () => {
+				resetCompactionRequest();
+			},
+		});
+	};
 
 	pi.registerCommand(COMMAND, {
 		description: t("forewarn.description"),
@@ -109,8 +146,12 @@ export default function compactForewarn(pi: ExtensionAPI): void {
 		description:
 			"Trigger context compaction. Only callable after the environment has issued a compaction forewarning " +
 			"(<system-reminder> about the approaching context limit); calls made before that forewarning fail. " +
-			"Compaction runs asynchronously and you will be automatically resumed once compaction finishes.",
+			"Call this tool by itself. It ends the current turn; compaction starts after the run goes idle, " +
+			"and you will be resumed once compaction finishes.",
 		promptSnippet: "trigger context compaction once the forewarning asks you to wrap up",
+		promptGuidelines: [
+			"Call request_compaction alone, as the last action of the turn. It ends the turn; do not pair it with other tool calls.",
+		],
 		parameters: Type.Object({
 			next_steps: Type.Optional(
 				Type.String({
@@ -119,7 +160,7 @@ export default function compactForewarn(pi: ExtensionAPI): void {
 				}),
 			),
 		}),
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
 			if (!armed) {
 				throw new Error(
 					`${TOOL_NAME} is locked: no compaction forewarning has been issued yet. ` +
@@ -127,49 +168,40 @@ export default function compactForewarn(pi: ExtensionAPI): void {
 				);
 			}
 			if (pending) {
+				// Same-batch duplicates must also terminate. One non-terminating
+				// result keeps the whole batch alive and the run continues.
 				return {
 					content: [{ type: "text", text: "Compaction was already requested and is still in progress. No action needed." }],
 					details: {},
+					terminate: true,
 				};
 			}
 			pending = true;
 
 			const nextSteps = (params as { next_steps?: string }).next_steps?.trim();
-			const customInstructions = nextSteps
+			pendingInstructions = nextSteps
 				? `Prioritize preserving the current progress and these remaining tasks: ${nextSteps}`
 				: undefined;
 
-			// compact() runs asynchronously; onComplete automatically resumes the agent
-			// so the model seamlessly continues its remaining tasks after compaction.
-			// onError re-arms the tool so the model may retry.
-			ctx.compact({
-				customInstructions,
-				onComplete: () => {
-					pending = false;
-					pi.sendUserMessage(
-						"[System Notice: Context compaction has completed successfully. " +
-							"Please review your previous plan and resume your remaining work seamlessly.]",
-						{ deliverAs: "followUp" },
-					);
-				},
-				onError: () => {
-					pending = false;
-				},
-			});
 			return {
 				content: [{
 					type: "text",
-					text: "Compaction has been triggered and is now running asynchronously. " +
-						"Your context will be compacted and you will be automatically resumed to continue your work.",
+					text: "Compaction is queued. This turn ends now. Context will be compacted once the run is idle, " +
+						"and you will then be resumed to continue your work.",
 				}],
 				details: {},
+				terminate: true,
 			};
 		},
 	});
 
 	pi.on("session_start", () => {
 		armed = false;
-		pending = false;
+		resetCompactionRequest();
+	});
+
+	pi.on("agent_settled", (_event, ctx) => {
+		startQueuedCompaction(ctx);
 	});
 
 	pi.on("tool_execution_end", (_event, ctx) => {
@@ -195,12 +227,13 @@ export default function compactForewarn(pi: ExtensionAPI): void {
 	});
 
 	// Any successful compaction (ours, /compact, threshold, or overflow) re-locks
-	// the tool; a failed or aborted one only clears `pending` so the model may retry.
+	// the tool. A failed or aborted one only drops the queued request; `armed`
+	// stays set so the model can call the tool again.
 	pi.on("session_compact", () => {
 		armed = false;
-		pending = false;
+		resetCompactionRequest();
 	});
 	pi.on("session_compact_failed", () => {
-		pending = false;
+		resetCompactionRequest();
 	});
 }
