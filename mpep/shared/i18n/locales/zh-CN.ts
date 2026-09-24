@@ -180,7 +180,7 @@ export const zhCN = {
   "forewarn.set": "压缩前问询余量已设置为 {tokens} tokens",
   "forewarn.invalid": "参数格式错误，用法: /m-ask [tokens] (正整数)",
   "plugin.compact-forewarn.name": "压缩前问询与主动压缩 (/m-ask)",
-  "plugin.compact-forewarn.desc": "临近窗口上限时提前注入英文提醒，让 AI 收尾原子工作后通过受控工具主动触发压缩",
+  "plugin.compact-forewarn.desc": "临近窗口上限时提前注入英文提醒，让 AI 收尾原子工作后主动触发压缩；AI 也可在里程碑或任务节点随时自由调用",
   "plugin.stderr-guard.name": "第三方库输出防穿透与日志弹窗 (/m-stderr)",
   "plugin.stderr-guard.desc": "拦截第三方库向 stderr 的裸文本输出，防止破坏 TUI 排版；右上角 10 秒倒计时提示，点击展开终端日志浏览器",
   "stderr.commandDesc": "在终端弹窗中查看被拦截捕获的第三方库 stderr 输出日志",

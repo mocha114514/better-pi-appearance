@@ -15,9 +15,11 @@ import { t } from "../shared/i18n/index.ts";
  * tool execution arms the extension: a short "asking before compact..." entry
  * is shown to the user and a <system-reminder> message is steered into the
  * conversation, asking the model to finish its current atomic unit of work and
- * then call the gated `request_compaction` tool. The tool errors while disarmed
- * and re-locks as soon as Pi reports the compaction (manual, threshold, or
- * overflow).
+ * then call the `request_compaction` tool. The tool itself is NOT gated: the
+ * model may call it at any time, ideally at clean milestones or major task
+ * boundaries, and the forewarning simply nudges it to do so near the limit.
+ * The forewarn flag resets as soon as Pi reports the compaction (manual,
+ * threshold, or overflow), so the extension can warn again as usage climbs.
  *
  * The tool does not call `ctx.compact()` itself. That API always aborts an
  * active run first, and the aborted follow-up assistant message is what the
@@ -144,11 +146,12 @@ export default function compactForewarn(pi: ExtensionAPI): void {
 		name: TOOL_NAME,
 		label: "Request Compaction",
 		description:
-			"Trigger context compaction. Only callable after the environment has issued a compaction forewarning " +
-			"(<system-reminder> about the approaching context limit); calls made before that forewarning fail. " +
-			"Call this tool by itself. It ends the current turn; compaction starts after the run goes idle, " +
+			"Trigger context compaction. Callable at any time; prefer clean boundaries such as completed milestones " +
+			"or major task nodes, so compaction never splits an atomic piece of work. When the environment issues " +
+			"a compaction forewarning (<system-reminder> about the approaching context limit), wrap up and call this " +
+			"promptly. Call this tool by itself. It ends the current turn; compaction starts after the run goes idle, " +
 			"and you will be resumed once compaction finishes.",
-		promptSnippet: "trigger context compaction once the forewarning asks you to wrap up",
+		promptSnippet: "trigger context compaction at a clean task boundary or milestone, or promptly when the forewarning asks you to wrap up",
 		promptGuidelines: [
 			"Call request_compaction alone, as the last action of the turn. It ends the turn; do not pair it with other tool calls.",
 		],
@@ -161,12 +164,6 @@ export default function compactForewarn(pi: ExtensionAPI): void {
 			),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
-			if (!armed) {
-				throw new Error(
-					`${TOOL_NAME} is locked: no compaction forewarning has been issued yet. ` +
-						"Only call it after the environment's <system-reminder> asks you to wrap up.",
-				);
-			}
 			if (pending) {
 				// Same-batch duplicates must also terminate. One non-terminating
 				// result keeps the whole batch alive and the run continues.
@@ -226,9 +223,11 @@ export default function compactForewarn(pi: ExtensionAPI): void {
 		);
 	});
 
-	// Any successful compaction (ours, /compact, threshold, or overflow) re-locks
-	// the tool. A failed or aborted one only drops the queued request; `armed`
-	// stays set so the model can call the tool again.
+	// Any successful compaction (ours, /compact, threshold, or overflow) resets
+	// the forewarn flag so the extension can warn again as usage climbs back up.
+	// A failed or aborted one only drops the queued request; `armed` stays set so
+	// the forewarn is not re-sent immediately (the tool itself remains callable
+	// at any time, so the model can retry on its own).
 	pi.on("session_compact", () => {
 		armed = false;
 		resetCompactionRequest();

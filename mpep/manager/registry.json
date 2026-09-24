@@ -80,7 +80,7 @@
     "id": "compact-forewarn",
     "name": "压缩前问询与主动压缩 (/m-ask)",
     "path": "./compact-forewarn/index.ts",
-    "desc": "临近窗口上限时提前注入英文提醒，让 AI 收尾原子工作后通过受控工具主动触发压缩",
+    "desc": "临近窗口上限时提前注入英文提醒，让 AI 收尾原子工作后主动触发压缩；AI 也可在里程碑或任务节点随时自由调用",
     "enabled": true
   },
   {
