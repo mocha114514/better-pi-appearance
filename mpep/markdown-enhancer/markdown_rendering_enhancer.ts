@@ -4,6 +4,14 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Markdown, type MarkdownTheme, renderLatex, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { installSelectionCopy } from "../shared/selection-copy.ts";
+import {
+	allocSelectionBlockId,
+	decorateFrame,
+	markTableLine,
+	type CellBox,
+	type FramePiece,
+} from "../shared/selection-markers.ts";
 
 const patchSlot = Symbol.for("mpep.markdown-enhancer.markdown-patches");
 const patches = globalThis as unknown as Record<symbol, (() => void) | undefined>;
@@ -36,11 +44,30 @@ export function resolveCodeBlockHighlightLang(raw: string | undefined): string |
 	return extension ? extension.toLowerCase() : trimmed;
 }
 
+/** Rounded code/math frame with the selection markers that a multi-line copy uses to drop the border. */
+function boxedFrame(
+	top: string,
+	body: FramePiece[],
+	bottom: string,
+	frameWidth: number,
+	sourceLines?: readonly string[],
+): string[] {
+	return decorateFrame(
+		[
+			{ role: "top", line: top, left: 0, right: 0, src: 0, part: 0, partCount: 1 },
+			...body,
+			{ role: "bottom", line: bottom, left: 0, right: 0, src: 0, part: 0, partCount: 1 },
+		],
+		frameWidth,
+		sourceLines,
+	);
+}
+
 /**
  * Patch Markdown.prototype.renderToken at runtime to enhance code blocks
  * with stylish full rounded borders, skipping mermaid diagrams.
  */
-function applyCodeBlockPatch(): () => void {
+export function applyCodeBlockPatch(): () => void {
 	const proto = Markdown.prototype as any;
 	let active = true;
 
@@ -74,29 +101,42 @@ function applyCodeBlockPatch(): () => void {
 				} else {
 					topHeader = border("╭" + "─".repeat(Math.max(0, width - 2)) + "╮");
 				}
-				lines.push(topHeader);
-
 				const rawText = token.text ?? "";
+				const sourceLines = rawText.split("\n");
 				const highlightLang = resolveCodeBlockHighlightLang(token.lang);
 				const highlightedLines: string[] = this.theme.highlightCode
 					? this.theme.highlightCode(rawText, highlightLang)
-					: rawText
-							.split("\n")
-							.map((line: string) => (this.theme.codeBlock ? this.theme.codeBlock(line) : line));
-
-				for (const hlLine of highlightedLines) {
-					const wrapped = wrapTextWithAnsi(hlLine, innerWidth);
-					if (wrapped.length === 0) {
-						lines.push(border("│ ") + " ".repeat(innerWidth) + border(" │"));
-					} else {
-						for (const subLine of wrapped) {
-							const padLen = Math.max(0, innerWidth - visibleWidth(subLine));
-							lines.push(border("│ ") + subLine + " ".repeat(padLen) + border(" │"));
-						}
+					: sourceLines.map((line: string) => (this.theme.codeBlock ? this.theme.codeBlock(line) : line));
+				const mapped = highlightedLines.length === sourceLines.length;
+				const body: FramePiece[] = [];
+				let visualIndex = 0;
+				for (let index = 0; index < highlightedLines.length; index++) {
+					const wrapped = wrapTextWithAnsi(highlightedLines[index] ?? "", innerWidth);
+					const parts = wrapped.length === 0 ? [""] : wrapped;
+					for (let part = 0; part < parts.length; part++) {
+						const subLine = parts[part] ?? "";
+						const padLen = Math.max(0, innerWidth - visibleWidth(subLine));
+						body.push({
+							role: "body",
+							line: border("│ ") + subLine + " ".repeat(padLen) + border(" │"),
+							left: 2,
+							right: 2,
+							src: mapped ? index : visualIndex,
+							part: mapped ? part : 0,
+							partCount: mapped ? parts.length : 1,
+						});
+						if (!mapped) visualIndex += 1;
 					}
 				}
-
-				lines.push(border("╰" + "─".repeat(Math.max(0, width - 2)) + "╯"));
+				lines.push(
+					...boxedFrame(
+						topHeader,
+						body,
+						border("╰" + "─".repeat(Math.max(0, width - 2)) + "╯"),
+						width,
+						mapped ? sourceLines : undefined,
+					),
+				);
 
 				if (nextTokenType && nextTokenType !== "space") {
 					lines.push("");
@@ -393,38 +433,53 @@ export function applyTablePatch(): () => void {
 			const rowRule = " ".repeat(rowRuleStart) + rowRuleStyle("─".repeat(rowRuleEnd - rowRuleStart + 1));
 
 			const lines: string[] = [];
+			const tableId = allocSelectionBlockId();
+			const cellBoxes: CellBox[] = [];
+			let cellCursor = 1;
+			for (let index = 0; index < numCols; index++) {
+				const width = columnWidths[index] ?? 1;
+				cellBoxes.push({ start: cellCursor, end: cellCursor + width });
+				cellCursor += width + columnGap.length;
+			}
 
 			// Emit one visual row (possibly multi-line after per-column wrapping).
-			const pushRowLines = (cellLines: string[][], bold: boolean) => {
-				const rowLineCount = Math.max(...cellLines.map((c) => c.length));
+			const pushRowLines = (cellLines: string[][], logicalRow: number, bold: boolean) => {
+				const rowLineCount = Math.max(1, ...cellLines.map((cell) => cell.length));
 				for (let lineIdx = 0; lineIdx < rowLineCount; lineIdx++) {
 					const parts = cellLines.map((cellColLines, colIdx) => {
 						const text = cellColLines[lineIdx] || "";
-						const padded = text + " ".repeat(Math.max(0, columnWidths[colIdx] - visibleWidth(text)));
+						const padded = text + " ".repeat(Math.max(0, (columnWidths[colIdx] ?? 0) - visibleWidth(text)));
 						return bold ? this.theme.bold(padded) : padded;
 					});
-					lines.push(` ${parts.join(columnGap)} `);
+					lines.push(markTableLine(` ${parts.join(columnGap)} `, tableId, logicalRow, cellBoxes));
 				}
 			};
 
-			const wrapRowCells = (row: any[]): string[][] =>
-				row.map((cell, i) => {
+			const captureRow = (row: any[]): { texts: string[]; wrapped: string[][] } => {
+				const texts: string[] = [];
+				const wrapped = row.map((cell: any, index: number) => {
 					const text = this.renderInlineTokens(cell.tokens || [], styleContext);
-					return this.wrapCellText(text, columnWidths[i], styleContext?.stylePrefix);
+					texts.push(text);
+					return this.wrapCellText(text, columnWidths[index], styleContext?.stylePrefix);
 				});
+				return { texts, wrapped };
+			};
 
-			lines.push(heavyRule);
-			pushRowLines(wrapRowCells(token.header), true);
-			lines.push(thinRule);
-			token.rows.forEach((row: any[], rowIndex: number) => {
+			const header = captureRow(token.header);
+			const body = token.rows.map((row: any[]) => captureRow(row));
+			const tableRows = [header.texts, ...body.map((row: { texts: string[] }) => row.texts)];
+			lines.push(markTableLine(heavyRule, tableId, -1, cellBoxes, tableRows));
+			pushRowLines(header.wrapped, 0, true);
+			lines.push(markTableLine(thinRule, tableId, -1, cellBoxes));
+			body.forEach((row: { wrapped: string[][] }, rowIndex: number) => {
 				// The separator is inserted after the whole visual row, so multi-line
 				// cells are crossed by at most one separator.
 				if (rowIndex > 0) {
-					lines.push(rowRule);
+					lines.push(markTableLine(rowRule, tableId, -1, cellBoxes));
 				}
-				pushRowLines(wrapRowCells(row), false);
+				pushRowLines(row.wrapped, rowIndex + 1, false);
 			});
-			lines.push(heavyRule);
+			lines.push(markTableLine(heavyRule, tableId, -1, cellBoxes));
 
 			if (nextTokenType && nextTokenType !== "space") {
 				lines.push(""); // Add spacing after table
@@ -747,24 +802,36 @@ export function applyMathPatch(): () => void {
 				} else {
 					topHeader = border("╭" + "─".repeat(Math.max(0, width - 2)) + "╮");
 				}
-				lines.push(topHeader);
-
 				const mathTextColor = (line: string) => `\x1b[38;5;153m${line}\x1b[0m`;
-
-				for (const rawLine of rawLines) {
+				const body: FramePiece[] = [];
+				for (let index = 0; index < rawLines.length; index++) {
+					const rawLine = rawLines[index] ?? "";
 					const styled = isRendered ? mathTextColor(rawLine) : rawLine;
 					const wrapped = wrapTextWithAnsi(styled, innerWidth);
-					if (wrapped.length === 0) {
-						lines.push(border("│ ") + " ".repeat(innerWidth) + border(" │"));
-					} else {
-						for (const subLine of wrapped) {
-							const padLen = Math.max(0, innerWidth - visibleWidth(subLine));
-							lines.push(border("│ ") + subLine + " ".repeat(padLen) + border(" │"));
-						}
+					const parts = wrapped.length === 0 ? [""] : wrapped;
+					for (let part = 0; part < parts.length; part++) {
+						const subLine = parts[part] ?? "";
+						const padLen = Math.max(0, innerWidth - visibleWidth(subLine));
+						body.push({
+							role: "body",
+							line: border("│ ") + subLine + " ".repeat(padLen) + border(" │"),
+							left: 2,
+							right: 2,
+							src: index,
+							part,
+							partCount: parts.length,
+						});
 					}
 				}
-
-				lines.push(border("╰" + "─".repeat(Math.max(0, width - 2)) + "╯"));
+				lines.push(
+					...boxedFrame(
+						topHeader,
+						body,
+						border("╰" + "─".repeat(Math.max(0, width - 2)) + "╯"),
+						width,
+						rawLines,
+					),
+				);
 
 				if (nextTokenType && nextTokenType !== "space") {
 					lines.push("");
@@ -856,11 +923,13 @@ export function setupMarkdownEnhancements(pi: ExtensionAPI): () => void {
 	const disposeBold = applyBoldPatch();
 	const disposeHeading = applyHeadingPatch();
 	const disposeMath = applyMathPatch();
+	const releaseSelection = installSelectionCopy();
 	let active = true;
 	const dispose = () => {
 		if (!active) return;
 		active = false;
 		// Each patch wraps renderToken after the previous one, so unwind in reverse order.
+		releaseSelection();
 		disposeMath();
 		disposeHeading();
 		disposeBold();
