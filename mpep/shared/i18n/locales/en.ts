@@ -182,6 +182,8 @@ export const en = {
   "plugin.compact-forewarn.desc": "Injects an early notice before context compaction so the AI can finish atomic tasks first; the AI can also trigger compaction freely at any milestone or task boundary",
   "plugin.stderr-guard.name": "Library stderr Output Guard (/m-stderr)",
   "plugin.stderr-guard.desc": "Intercepts raw library stderr writes to prevent TUI screen tearing, shows a 10s toast alert, and provides an interactive terminal log modal",
+  "plugin.user-bubble.name": "User message rounded border bubble",
+  "plugin.user-bubble.desc": "Replaces the full-width solid background block of user messages with a clean, modern colored rounded border",
   "stderr.commandDesc": "View intercepted third-party library stderr logs in a terminal modal",
   "stderr.empty": "No stderr output has been captured. System is clean.",
 } as const;

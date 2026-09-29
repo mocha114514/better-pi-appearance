@@ -28,7 +28,8 @@
       "./usage/index.ts",
       "./compact-forewarn/index.ts",
       "./export/index.ts",
-      "./stderr-guard/index.ts"
+      "./stderr-guard/index.ts",
+      "./user-bubble/index.ts"
     ]
   }
 }

@@ -28,6 +28,10 @@ Double-click to expand:
 
 ![Double click expand](assets/double-click-expand.png)
 
+### User Message Bubble Border
+
+Replaces the full-width solid background block of user messages with a clean, modern colored rounded border, eliminating visual harshness and keeping the background transparent. Can be toggled independently via `/m-mng`.
+
 ### Turn Navigator
 
 Adds a navigator on the right side to quickly review each round's user prompt and jump to it with a click.

@@ -183,6 +183,8 @@ export const zhCN = {
   "plugin.compact-forewarn.desc": "临近窗口上限时提前注入英文提醒，让 AI 收尾原子工作后主动触发压缩；AI 也可在里程碑或任务节点随时自由调用",
   "plugin.stderr-guard.name": "第三方库输出防穿透与日志弹窗 (/m-stderr)",
   "plugin.stderr-guard.desc": "拦截第三方库向 stderr 的裸文本输出，防止破坏 TUI 排版；右上角 10 秒倒计时提示，点击展开终端日志浏览器",
+  "plugin.user-bubble.name": "用户消息彩色圆角边框",
+  "plugin.user-bubble.desc": "将用户消息的整行深色实心色块替换为精致通透的彩色圆角边框包裹",
   "stderr.commandDesc": "在终端弹窗中查看被拦截捕获的第三方库 stderr 输出日志",
   "stderr.empty": "当前没有任何被拦截的 stderr 输出，系统运行良好。",
 } as const satisfies Record<keyof typeof en, string>;

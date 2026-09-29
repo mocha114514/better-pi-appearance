@@ -96,5 +96,12 @@
     "path": "./stderr-guard/index.ts",
     "desc": "拦截第三方库向 stderr 的裸文本输出，防止破坏 TUI 排版；右上角 10 秒倒计时提示，点击展开终端日志浏览器",
     "enabled": true
+  },
+  {
+    "id": "user-bubble",
+    "name": "用户消息彩色圆角边框",
+    "path": "./user-bubble/index.ts",
+    "desc": "将用户消息的整行深色实心色块替换为精致通透的彩色圆角边框包裹",
+    "enabled": true
   }
 ]
