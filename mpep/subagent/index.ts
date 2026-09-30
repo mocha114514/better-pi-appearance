@@ -232,6 +232,23 @@ export default function (pi: ExtensionAPI): void {
 					return;
 				}
 				if (!stillRegistered()) return;
+				if (!output.trim()) {
+					// Zero-output "completion": almost always a provider failure that
+					// ended the run before any prose or submit_result (observed live:
+					// local providers intermittently return empty responses). Treat it
+					// as an interruption, not a delivery — the context is intact and
+					// the work is usually harvestable by a cheap continuation.
+					instance.meta.lastError = "Run ended without producing any output (likely a provider failure). The context is intact.";
+					instance.meta.unread = true;
+					instance.meta.status = "recovered";
+					currentPool.saveMeta(instance);
+					notify(
+						`Subagent "${instance.meta.id}" (agent: ${instance.meta.agent}) ended WITHOUT producing any output (likely a provider failure). ` +
+							`Its context is intact. Call subagent_check({ instance: "${instance.meta.id}" }) for details; ` +
+							`the work is usually harvestable by resuming with a wrap-up instruction.`,
+					);
+					return;
+				}
 				// Persist the mailbox: result.md holds the deliverable, meta holds
 				// the unread mark, so a main-session restart never loses a result.
 				instance.finalOutput = output;
