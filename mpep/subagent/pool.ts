@@ -36,6 +36,11 @@ export interface InstanceMeta {
 	createdAt: number;
 	updatedAt: number;
 	status: InstanceStatus;
+	/** Persisted mailbox state: an unread result survives a main-session
+	 * restart; the settle sweep spares it until subagent_check reads it. */
+	unread?: boolean;
+	/** Persisted interruption detail, shown by subagent_check on recovery. */
+	lastError?: string;
 }
 
 export interface Instance {
@@ -50,13 +55,13 @@ export interface Instance {
 	/** Set when the main agent deliberately aborted this run: the background
 	 * completion handler consumes the flag and skips the wake-up notification. */
 	abortInitiated?: boolean;
-	/** Set when the completion notification has been queued for the main agent
-	 * but not yet consumed by a run; the settle sweep spares these instances so
-	 * a queued message never references a deleted instance. */
-	notificationPending?: boolean;
+	/** In-flight background run handler; subagent_abort awaits it so a
+	 * continuation can never overlap the run it just interrupted. */
+	runPromise?: Promise<void>;
 }
 
 const META_FILE = "meta.json";
+const RESULT_FILE = "result.md";
 
 export function emptyUsage(): UsageStats {
 	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 };
@@ -133,13 +138,12 @@ export class InstancePool {
 	}
 
 	/** Drop every instance still awaiting a keep/drop decision. Returns dropped ids.
-	 * Instances whose completion notification has been queued but not yet
-	 * consumed by a main-agent run are spared: deleting them first would orphan
-	 * the queued message (it references the instance the model must decide on). */
+	 * Instances with an UNREAD result are spared: the main agent has not had a
+	 * chance to fetch it via subagent_check yet. */
 	sweepUndecided(): string[] {
 		const dropped: string[] = [];
 		for (const instance of this.list()) {
-			if (instance.meta.status === "awaiting_decision" && !instance.notificationPending) {
+			if (instance.meta.status === "awaiting_decision" && !instance.meta.unread) {
 				this.drop(instance.meta.id);
 				dropped.push(instance.meta.id);
 			}
@@ -147,11 +151,19 @@ export class InstancePool {
 		return dropped;
 	}
 
-	/** Best-effort kill of all live subprocesses (parent shutdown). */
+	/**
+	 * Shutdown reaping (parent exit / reload). The registry is cleared FIRST so
+	 * any dying async callback (background completion racing the teardown) sees
+	 * itself unregistered and stays silent — no ghost notifications waking the
+	 * main agent while it is going away. Kills are synchronous and forced:
+	 * timer-based escalation does not run inside exit handlers.
+	 */
 	killAll(): void {
-		for (const instance of this.instances.values()) {
+		const instances = [...this.instances.values()];
+		this.instances.clear();
+		for (const instance of instances) {
 			try {
-				instance.client?.kill();
+				instance.client?.killSync();
 			} catch {
 				// Already gone.
 			}
@@ -183,8 +195,9 @@ export class InstancePool {
 				continue; // No readable metadata: not one of ours / too corrupt.
 			}
 			// Whatever it was doing when the main session died, it is now an
-			// on-disk leftover awaiting the main agent's decision.
-			meta.status = "recovered";
+			// on-disk leftover awaiting the main agent's decision. One exception:
+			// an instance that had COMPLETED with an unread result keeps its
+			// mailbox — the result file is the whole point of the mailbox model.
 			const instance: Instance = {
 				meta,
 				dir: instancePath,
@@ -192,6 +205,16 @@ export class InstancePool {
 				usage: emptyUsage(),
 				finalOutput: "",
 			};
+			if (meta.status === "awaiting_decision") {
+				try {
+					instance.finalOutput = fs.readFileSync(path.join(instancePath, RESULT_FILE), "utf-8");
+				} catch {
+					// Result file missing/corrupt: degrade to a resumable leftover.
+					meta.status = "recovered";
+				}
+			} else {
+				meta.status = "recovered";
+			}
 			this.instances.set(meta.id, instance);
 			recovered.push(instance);
 		}

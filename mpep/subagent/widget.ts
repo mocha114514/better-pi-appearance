@@ -61,13 +61,16 @@ class SubagentOverlay implements Component {
 		private readonly tui: TUI,
 		private readonly ctx: ExtensionContext,
 		private readonly pool: InstancePool,
+		/** Content rows this instance may use: shrunk when the space above the
+		 * indicator is tight, so the panel never covers what it anchors to. */
+		private readonly viewportCap: number = MAX_VIEWPORT_ROWS,
 	) {}
 
 	invalidate(): void {}
 
 	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
 		if (event.type !== "wheel" || event.wheelDelta === undefined) return undefined;
-		const maxOffset = Math.max(0, this.pool.list().length - MAX_VIEWPORT_ROWS);
+		const maxOffset = Math.max(0, this.pool.list().length - this.viewportCap);
 		// wheelDelta is in logical lines; negative scrolls up.
 		this.scrollOffset = Math.max(0, Math.min(maxOffset, this.scrollOffset + event.wheelDelta));
 		return { handled: true };
@@ -103,14 +106,14 @@ class SubagentOverlay implements Component {
 		const topInner = Math.max(0, boxWidth - 2 - plain(title));
 		lines.push(border("╭") + theme.fg("accent", title) + border("─".repeat(topInner) + "╮"));
 
-		const slice = rows.slice(this.scrollOffset, this.scrollOffset + MAX_VIEWPORT_ROWS);
+		const slice = rows.slice(this.scrollOffset, this.scrollOffset + this.viewportCap);
 		for (const row of slice) {
 			const content = ` ${row.dot} ${row.id.padEnd(idW)}  ${row.model.padEnd(modelW)}  ${row.thinking.padEnd(thinkW)}  ${row.status}`;
 			lines.push(truncateToWidth(`${border("│")}${content}`, boxWidth - 1, "") + border("│"));
 		}
 
-		const scrolled = items.length > MAX_VIEWPORT_ROWS;
-		const hint = scrolled ? ` ${this.scrollOffset + 1}-${Math.min(items.length, this.scrollOffset + MAX_VIEWPORT_ROWS)}/${items.length} ` : "";
+		const scrolled = items.length > this.viewportCap;
+		const hint = scrolled ? ` ${this.scrollOffset + 1}-${Math.min(items.length, this.scrollOffset + this.viewportCap)}/${items.length} ` : "";
 		const bottomInner = Math.max(0, boxWidth - 2 - plain(hint));
 		lines.push(border(`╰${"─".repeat(bottomInner)}`) + theme.fg("dim", hint) + border("╯"));
 		return lines;
@@ -121,14 +124,16 @@ class SubagentIndicator implements Component {
 	constructor(
 		private readonly ctx: ExtensionContext,
 		private readonly pool: InstancePool,
-		private readonly toggleOverlay: () => void,
+		private readonly toggleOverlay: (anchorRow?: number) => void,
 	) {}
 
 	invalidate(): void {}
 
 	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
 		if (event.type === "click" && event.button === "left" && event.y === 0) {
-			this.toggleOverlay();
+			// screenY is the indicator's absolute terminal row: the overlay opens
+			// UPWARD with its bottom edge glued to this line.
+			this.toggleOverlay(event.screenY);
 			return { handled: true };
 		}
 		return undefined;
@@ -155,22 +160,46 @@ export function installSubagentWidget(ctx: ExtensionContext, pool: InstancePool)
 
 	let tui: TUI | undefined;
 	let overlayHandle: OverlayHandle | undefined;
+	let overlayAnchorRow: number | undefined;
 
 	const closeOverlay = () => {
 		overlayHandle?.hide();
 		overlayHandle = undefined;
 	};
-	const toggleOverlay = () => {
-		if (!tui) return;
+	const openOverlay = (anchorRow?: number) => {
+		if (!tui || pool.list().length === 0) return;
+		overlayAnchorRow = anchorRow;
+		if (anchorRow !== undefined) {
+			// Upward expansion: bottom border sits directly above the indicator
+			// row, so the indicator reads as the panel's lower edge. The viewport
+			// shrinks to the space actually available above; if even one content
+			// row does not fit, fall back to the legacy downward anchor rather
+			// than covering the indicator (which is also the close button).
+			const cap = Math.min(MAX_VIEWPORT_ROWS, anchorRow - 2);
+			if (cap >= 1) {
+				const height = Math.min(pool.list().length, cap) + 2;
+				overlayHandle = tui.showOverlay(new SubagentOverlay(tui, ctx, pool, cap), {
+					row: Math.max(0, anchorRow - height),
+					col: 1,
+					maxHeight: MAX_VIEWPORT_ROWS + 2,
+					nonCapturing: true,
+				});
+				return;
+			}
+		}
+		// No click coordinates or no room above: legacy anchor.
+		overlayHandle = tui.showOverlay(new SubagentOverlay(tui, ctx, pool), {
+			anchor: "bottom-left",
+			margin: 1,
+			maxHeight: MAX_VIEWPORT_ROWS + 2,
+			nonCapturing: true,
+		});
+	};
+	const toggleOverlay = (anchorRow?: number) => {
 		if (overlayHandle) {
 			closeOverlay();
-		} else if (pool.list().length > 0) {
-			overlayHandle = tui.showOverlay(new SubagentOverlay(tui, ctx, pool), {
-				anchor: "bottom-left",
-				margin: 1,
-				maxHeight: MAX_VIEWPORT_ROWS + 2,
-				nonCapturing: true,
-			});
+		} else {
+			openOverlay(anchorRow);
 		}
 	};
 
@@ -180,8 +209,15 @@ export function installSubagentWidget(ctx: ExtensionContext, pool: InstancePool)
 	});
 
 	// Live refresh; auto-close the overlay when the last instance goes away.
+	// While open, re-anchor on pool changes so the bottom edge stays glued to
+	// the indicator even when the item count (and thus height) changes.
 	const unsubscribe = pool.onChange(() => {
-		if (pool.list().length === 0) closeOverlay();
+		if (pool.list().length === 0) {
+			closeOverlay();
+		} else if (overlayHandle && overlayAnchorRow !== undefined) {
+			closeOverlay();
+			openOverlay(overlayAnchorRow);
+		}
 		tui?.requestRender();
 	});
 

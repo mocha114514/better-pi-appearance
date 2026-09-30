@@ -23,7 +23,7 @@
  *     resolved from System32 with spawn errors consumed.
  */
 
-import { type ChildProcess, spawn } from "node:child_process";
+import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { StringDecoder } from "node:string_decoder";
@@ -255,13 +255,24 @@ export class RpcSubprocess {
 		});
 	}
 
-	/** Fire a prompt; the returned promise resolves once the run is accepted. */
+	/** Fire a prompt; the returned promise resolves once the run is accepted.
+	 * followUp queueing: a busy child (e.g. mid-compaction from the injected
+	 * compact-forewarn) queues the task instead of rejecting it. */
 	prompt(message: string): Promise<unknown> {
-		return this.send({ type: "prompt", message });
+		return this.send({ type: "prompt", message, streamingBehavior: "followUp" });
 	}
 
 	abort(): Promise<unknown> {
 		return this.send({ type: "abort" }).catch(() => undefined);
+	}
+
+	/** Live session state (isStreaming/isCompacting/pendingMessageCount).
+	 * Used after agent_settled to confirm the child is TRULY idle: 0.85.x runs
+	 * auto-compaction asynchronously after settle, and a compaction-resumed run
+	 * would otherwise look like fresh output arriving after delivery. */
+	async getState(): Promise<{ isStreaming?: boolean; isCompacting?: boolean; pendingMessageCount?: number }> {
+		const state = (await this.send({ type: "get_state" })) as Record<string, unknown>;
+		return state;
 	}
 
 	/**
@@ -296,6 +307,31 @@ export class RpcSubprocess {
 				}
 			}, 1_500);
 			timer.unref?.();
+		}
+		this.handleClose(null);
+	}
+
+	/**
+	 * Synchronous hard kill for process-exit and reload paths, where kill()'s
+	 * escalation timer would never fire (unref'd timers do not run during
+	 * exit). Blocks briefly; only ever called at teardown.
+	 */
+	killSync(): void {
+		const proc = this.proc;
+		if (proc && proc.exitCode === null && !proc.killed) {
+			const pid = proc.pid;
+			try {
+				if (process.platform === "win32") {
+					if (pid !== undefined) {
+						const root = process.env.SystemRoot || "C:\\Windows";
+						spawnSync(path.join(root, "System32", "taskkill.exe"), ["/pid", String(pid), "/T", "/F"], { stdio: "ignore" });
+					}
+				} else if (pid !== undefined) {
+					process.kill(-pid, "SIGKILL");
+				}
+			} catch {
+				// Already gone.
+			}
 		}
 		this.handleClose(null);
 	}

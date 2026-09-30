@@ -6,9 +6,13 @@
  *   mpep-cache/subagent/agents/             agent definitions (.md)
  *   mpep-cache/subagent/sessions/<main>/<instance>/   session files + metadata
  *
- * Lifecycle contract with the main agent:
- *   - every delivery is followed by a mandatory keep/drop decision via
- *     subagent_decide; undecided instances are swept (dropped) at turn end;
+ * Lifecycle contract with the main agent (all dispatches are ASYNC):
+ *   - the subagent tool returns immediately; completion is announced by a
+ *     light steer notification and the result is fetched via subagent_check
+ *     (mailbox model — results are never pushed in full);
+ *   - after reading a result the main agent must keep or drop the instance
+ *     via subagent_decide; undecided READ instances are swept (dropped) at
+ *     turn end, unread results are spared;
  *   - "keep" retains the resident process and its on-disk session for exactly
  *     one follow-up; the question is asked again after the next delivery;
  *   - anything left on disk by an interrupted run is recovered at session
@@ -188,39 +192,61 @@ export default function (pi: ExtensionAPI): void {
 	}
 
 	/**
-	 * Background completion path: the tool call already returned, so the
-	 * result is delivered as a queued follow-up message that wakes the main
-	 * agent (triggerTurn) after whatever it is currently doing (followUp).
+	 * Async completion path (mailbox model). The dispatch tool call has already
+	 * returned; the full result waits in the instance until the main agent
+	 * fetches it via subagent_check. Only a LIGHT steer notification is pushed:
+	 * it lands at the next tool boundary mid-run, or wakes the main agent when
+	 * idle. Results are never pushed in full — the main agent pulls them.
 	 */
 	function runInBackground(instance: Instance, agentConfig: AgentConfig | undefined, task: string, currentPool: InstancePool): void {
-		void (async () => {
-			// True while this instance is registered; drop() removes it, and any
-			// async continuation must then stay silent (no ghost writes, no ghost
-			// notifications about an instance the main agent already deleted).
+		instance.runPromise = (async () => {
+			// True while this instance is registered; drop() removes it and
+			// shutdown clears the whole registry, so any async continuation must
+			// then stay silent (no ghost writes, no ghost notifications).
 			const stillRegistered = () => currentPool.get(instance.meta.id) === instance;
+			const notify = (content: string) => {
+				try {
+					pi.sendMessage(
+						{ customType: "mpep-subagent-notice", display: false, content },
+						{ triggerTurn: true, deliverAs: "steer" },
+					);
+				} catch {
+					// During reload/shutdown the old extension context is already
+					// invalidated; the instance stays discoverable via subagent_list.
+				}
+			};
 			try {
 				const outcome = await runPrompt(instance, task, undefined, undefined);
 				// Deliberate abort: consume the run silently. The abort tool already
 				// moved the instance to awaiting_decision and told the main agent.
-				// Checked BEFORE finalization so no nudge prompt is sent either.
+				// Checked BEFORE and AFTER finalization: the abort may also arrive
+				// while the structured-output nudge round is in flight.
 				if (instance.abortInitiated) {
 					instance.abortInitiated = false;
 					return;
 				}
 				if (!stillRegistered()) return;
 				const output = await finalizeStructuredOutput(instance, agentConfig, outcome);
+				if (instance.abortInitiated) {
+					instance.abortInitiated = false;
+					return;
+				}
 				if (!stillRegistered()) return;
+				// Persist the mailbox: result.md holds the deliverable, meta holds
+				// the unread mark, so a main-session restart never loses a result.
 				instance.finalOutput = output;
 				instance.meta.status = "awaiting_decision";
-				instance.notificationPending = true;
+				instance.meta.unread = true;
+				instance.meta.lastError = undefined;
+				try {
+					fs.writeFileSync(path.join(instance.dir, "result.md"), output, "utf-8");
+				} catch {
+					// Best-effort; the in-memory copy still serves this session.
+				}
 				currentPool.saveMeta(instance);
-				pi.sendMessage(
-					{
-						customType: "mpep-subagent-result",
-						display: false,
-						content: `Background subagent "${instance.meta.id}" (agent: ${instance.meta.agent}) has finished.\n\n${output || "(no text output)"}${decisionInstruction(instance.meta.id)}`,
-					},
-					{ triggerTurn: true, deliverAs: "followUp" },
+				notify(
+					`Subagent "${instance.meta.id}" (agent: ${instance.meta.agent}) has completed. ` +
+						`Call subagent_check({ instance: "${instance.meta.id}" }) to read its result, then keep or drop it.`,
 				);
 			} catch (error) {
 				if (instance.abortInitiated) {
@@ -228,22 +254,15 @@ export default function (pi: ExtensionAPI): void {
 					return;
 				}
 				if (!stillRegistered()) return;
+				const message = error instanceof Error ? error.message : String(error);
+				instance.meta.lastError = message;
+				instance.meta.unread = true;
 				instance.meta.status = "recovered";
 				currentPool.saveMeta(instance);
-				const message = error instanceof Error ? error.message : String(error);
-				try {
-					pi.sendMessage(
-						{
-						customType: "mpep-subagent-result",
-						display: false,
-						content: `Background subagent "${instance.meta.id}" (agent: ${instance.meta.agent}) was interrupted: ${message}\nIts context is preserved on disk. Resume it with subagent({ instance: "${instance.meta.id}", task }) or drop it with subagent_decide.`,
-						},
-						{ triggerTurn: true, deliverAs: "followUp" },
-					);
-				} catch {
-					// During reload/shutdown the old extension context is already
-					// invalidated; the leftover scan reports the instance anyway.
-				}
+				notify(
+					`Subagent "${instance.meta.id}" (agent: ${instance.meta.agent}) was interrupted: ${truncate(message, 200)} ` +
+						`Its context is preserved on disk. Call subagent_check({ instance: "${instance.meta.id}" }) for details, then resume or drop it.`,
+				);
 			}
 		})();
 	}
@@ -259,10 +278,18 @@ export default function (pi: ExtensionAPI): void {
 		if (!client) return Promise.reject(new Error("instance has no live process"));
 		// An already-aborted signal (e.g. Esc during startup) must not send the task.
 		if (signal?.aborted) return Promise.reject(new Error("aborted by user"));
+		// Usage is per-task and reset by the dispatch site; nudge rounds of the
+		// same delivery (finalizeStructuredOutput) must accumulate onto it.
 
 		return new Promise<RunOutcome>((resolve, reject) => {
 			let currentTextItem = "";
 			let lastMessages: unknown;
+			let done = false;
+			let settleTimer: ReturnType<typeof setTimeout> | undefined;
+			let sawRunStart = false;
+			let sawAgentEnd = false;
+			let idleStreak = 0;
+			let probes = 0;
 			const pushToolItem = (text: string) => {
 				currentTextItem = "";
 				instance.displayItems.push({ type: "toolCall", text });
@@ -295,11 +322,14 @@ export default function (pi: ExtensionAPI): void {
 					report("subagent running");
 				} else if (event.type === "tool_execution_end" && event.isError) {
 					instance.displayItems.push({ type: "toolResult", text: String(event.toolName ?? ""), isError: true });
+				} else if (event.type === "agent_start") {
+					sawRunStart = true;
 				} else if (event.type === "agent_end") {
 					// NOT the finish line: retries and compaction continuations (e.g.
 					// the injected compact-forewarn) resume the child after agent_end.
 					// Accumulate usage per segment; the run truly ends at agent_settled.
 					lastMessages = event.messages;
+					sawAgentEnd = true;
 					const segment = aggregateUsage(event.messages);
 					instance.usage.turns += segment.turns;
 					instance.usage.input += segment.input;
@@ -309,10 +339,46 @@ export default function (pi: ExtensionAPI): void {
 					instance.usage.cost += segment.cost;
 					instance.usage.contextTokens = segment.contextTokens;
 				} else if (event.type === "agent_settled") {
-					cleanup();
-					resolve({ finalOutput: extractFinalText(lastMessages), messages: lastMessages });
+					void confirmIdle();
 				}
 			});
+
+			// 0.85.x runs auto-compaction asynchronously AFTER agent_settled, and a
+			// compaction-resumed run produces further output afterwards. Worse, a
+			// FAILED compaction emits no settle at all, and a prompt handled as an
+			// extension command starts no run at all (no events, no settle). So the
+			// poll loop is armed the moment the prompt is accepted: probe live state
+			// until the child is durably idle, then deliver. The no-run watchdog
+			// (20 idle probes without agent_start ~ 10s) frees command-only prompts;
+			// the probe cap guarantees delivery even if the child wedges.
+			const confirmIdle = () => {
+				if (done) return;
+				settleTimer = setTimeout(() => {
+					void (async () => {
+						if (done) return;
+						try {
+							const state = await client.getState();
+							const busy = state.isStreaming || state.isCompacting || (state.pendingMessageCount ?? 0) > 0;
+							idleStreak = busy ? 0 : idleStreak + 1;
+							probes += 1;
+							const delivered = (sawAgentEnd && idleStreak >= 2) || (!sawRunStart && idleStreak >= 20);
+							if (!delivered && probes < 1200) {
+								confirmIdle();
+								return;
+							}
+						} catch {
+							return; // process gone: offExit handles the rejection
+						}
+						finish();
+					})();
+				}, 500);
+			};
+			const finish = () => {
+				if (done) return;
+				done = true;
+				cleanup();
+				resolve({ finalOutput: extractFinalText(lastMessages), messages: lastMessages });
+			};
 
 			const offExit = client.onExit((code) => {
 				cleanup();
@@ -328,14 +394,18 @@ export default function (pi: ExtensionAPI): void {
 			const cleanup = () => {
 				offEvent();
 				offExit();
+				if (settleTimer) clearTimeout(settleTimer);
 				signal?.removeEventListener("abort", onAbort);
 			};
 			signal?.addEventListener("abort", onAbort, { once: true });
 
-			client.prompt(task).catch((error: unknown) => {
-				cleanup();
-				reject(error instanceof Error ? error : new Error(String(error)));
-			});
+			client.prompt(task).then(
+				() => confirmIdle(), // arm the idle watchdog as soon as accepted
+				(error: unknown) => {
+					cleanup();
+					reject(error instanceof Error ? error : new Error(String(error)));
+				},
+			);
 		});
 	}
 
@@ -383,21 +453,6 @@ export default function (pi: ExtensionAPI): void {
 		`instance "${id}" and decision "keep" (retain it for follow-up exchanges) or "drop" (delete it). ` +
 		"If you have not decided by the time your run ends, it is dropped automatically.";
 
-	function resultFor(instance: Instance, output: string, isError = false) {
-		return {
-			content: [{ type: "text" as const, text: output + (isError ? "" : decisionInstruction(instance.meta.id)) }],
-			details: {
-				instanceId: instance.meta.id,
-				agent: instance.meta.agent,
-				displayItems: instance.displayItems,
-				finalOutput: output,
-				usage: instance.usage,
-				isError,
-			},
-			isError,
-		};
-	}
-
 	// Embed the agent list so the model sees its options without a discovery
 	// round-trip. Registration-time snapshot: agents edited mid-session are
 	// picked up on dispatch (discovery re-scans), subagent_list shows latest.
@@ -410,20 +465,20 @@ export default function (pi: ExtensionAPI): void {
 			"Delegate a task to a specialized subagent running as an isolated resident Pi process. " +
 			"Start a new one with { agent, task }; continue an existing one with { instance, task }. " +
 			`Available agents: ${agentsSummary}. ` +
-			"After EVERY delivery you must call subagent_decide to keep or drop the instance. " +
-			"Set background: true for long-running tasks: the call returns immediately and the result arrives later as a follow-up message.",
+			"Every dispatch is ASYNCHRONOUS: the call returns immediately, a light notification arrives when the " +
+			"subagent completes, and you fetch the full result with subagent_check. " +
+			"After reading a result you must call subagent_decide to keep or drop the instance.",
 		promptSnippet: "delegate an isolated task to a specialized subagent process",
 		promptGuidelines: [
-			"After each subagent delivery, immediately call subagent_decide (keep or drop) for that instance.",
+			"After reading a subagent result via subagent_check, immediately call subagent_decide (keep or drop) for that instance.",
 			"Pass the instance id to continue a kept subagent instead of starting a new one.",
-			"Use background: true for long-running tasks; foreground dispatch blocks you until the subagent finishes.",
+			"Dispatches are asynchronous: do not idle-wait after dispatching; the completion notification will arrive.",
 			"Name new instances meaningfully (snake_case via the name parameter), e.g. name: frontend_auth_investigation.",
 		],
 		parameters: Type.Object({
 			agent: Type.Optional(Type.String({ description: "Agent name from a .md definition (required for a new instance)." })),
 			task: Type.String({ description: "The task or follow-up instruction for the subagent." }),
 			instance: Type.Optional(Type.String({ description: "Existing instance id to continue; omit to start fresh." })),
-			background: Type.Optional(Type.Boolean({ description: "Run asynchronously: return immediately and get the result via a follow-up message. Default false (block until done)." })),
 			name: Type.Optional(Type.String({
 			description:
 				"Custom name for a NEW instance (ignored when continuing via instance). The full id becomes \"<agent>-<name>\". " +
@@ -433,7 +488,7 @@ export default function (pi: ExtensionAPI): void {
 			})),
 		}),
 
-		async execute(_toolCallId, params, signal, onUpdate, context) {
+		async execute(_toolCallId, params, signal, _onUpdate, context) {
 			const currentPool = ensurePool(context);
 			const task = params.task;
 			let instance: Instance | undefined;
@@ -457,11 +512,20 @@ export default function (pi: ExtensionAPI): void {
 					// both spawn children onto the same session directory.
 					const previousStatus = instance.meta.status;
 					instance.meta.status = "running";
-					fs.mkdirSync(instance.dir, { recursive: true });
-					const spawnPlan = buildSpawn(agentConfig, instance, context.cwd, context.thinkingLevel ?? "off", context.model ? `${context.model.provider}/${context.model.id}` : undefined);
-					instance.meta.model = spawnPlan.model;
-					instance.meta.thinking = spawnPlan.thinking;
-					const client = new RpcSubprocess(context.cwd, spawnPlan.args, spawnPlan.env);
+					let client: RpcSubprocess;
+					try {
+						// All synchronous preparation lives inside the reservation: a
+						// throw here must roll the status back, or the instance wedges
+						// as "running" with no process behind it.
+						fs.mkdirSync(instance.dir, { recursive: true });
+						const spawnPlan = buildSpawn(agentConfig, instance, context.cwd, context.thinkingLevel ?? "off", context.model ? `${context.model.provider}/${context.model.id}` : undefined);
+						instance.meta.model = spawnPlan.model;
+						instance.meta.thinking = spawnPlan.thinking;
+						client = new RpcSubprocess(context.cwd, spawnPlan.args, spawnPlan.env);
+					} catch (error) {
+						instance.meta.status = previousStatus;
+						throw error;
+					}
 					const onStartAbort = () => client.kill();
 					signal?.addEventListener("abort", onStartAbort, { once: true });
 					try {
@@ -528,6 +592,22 @@ export default function (pi: ExtensionAPI): void {
 
 			instance.meta.status = "running";
 			instance.displayItems = [];
+			// Per-task reset: usage accumulates across the whole delivery (including
+			// nudge rounds), and a previous task's mailbox contents must never leak
+			// into this one (a freshly aborted run would otherwise "deliver" the
+			// stale result of the task before it).
+			instance.usage = emptyUsage();
+			instance.finalOutput = "";
+			instance.meta.lastError = undefined;
+			instance.meta.unread = false;
+			// Invalidate the persisted mailbox too: a restart between an abort and
+			// the next delivery must never hydrate the PREVIOUS task's result.md
+			// and present it as this task's deliverable.
+			try {
+				fs.rmSync(path.join(instance.dir, "result.md"), { force: true });
+			} catch {
+				// Best-effort; recovery degrades to "no result" instead.
+			}
 			currentPool.saveMeta(instance);
 
 			// A kept instance may hold a previous run's submission; clear it so a
@@ -536,39 +616,22 @@ export default function (pi: ExtensionAPI): void {
 				fs.rmSync(path.join(instance.dir, "output.json"), { force: true });
 			}
 
-			if (params.background) {
-				runInBackground(instance, agentConfig, task, currentPool);
-				return {
-					content: [{
-						type: "text" as const,
-						text: `Subagent "${instance.meta.id}" is running in the background; you will be notified when it finishes. ` +
-							"You may keep working or end your turn now. To interrupt it early, call subagent_abort.",
-					}],
-					details: {
-						instanceId: instance.meta.id,
-						agent: instance.meta.agent,
-						displayItems: instance.displayItems,
-						finalOutput: "",
-						usage: instance.usage,
-					},
-				};
-			}
-
-			try {
-				const outcome = await runPrompt(instance, task, signal ?? undefined, onUpdate);
-				const output = await finalizeStructuredOutput(instance, agentConfig, outcome);
-				instance.finalOutput = output;
-				instance.meta.status = "awaiting_decision";
-				currentPool.saveMeta(instance);
-				return resultFor(instance, output || "(subagent produced no text output)");
-			} catch (error) {
-				// Aborted or crashed mid-run: the session file stays on disk and the
-				// instance becomes a leftover the main agent can resume or drop.
-				instance.meta.status = "recovered";
-				currentPool.saveMeta(instance);
-				const message = error instanceof Error ? error.message : String(error);
-				return resultFor(instance, `Subagent "${instance.meta.id}" was interrupted: ${message}\nIts context is preserved on disk; resume it later with subagent({ instance: "${instance.meta.id}", task }) or drop it with subagent_decide.`, true);
-			}
+			runInBackground(instance, agentConfig, task, currentPool);
+			return {
+				content: [{
+					type: "text" as const,
+					text: `Subagent "${instance.meta.id}" is now running asynchronously. ` +
+						"You will receive a light notification when it completes; fetch its result with subagent_check. " +
+						"Do not idle-wait for it: continue with other work or end your turn. To interrupt it, call subagent_abort.",
+				}],
+				details: {
+					instanceId: instance.meta.id,
+					agent: instance.meta.agent,
+					displayItems: instance.displayItems,
+					finalOutput: "",
+					usage: instance.usage,
+				},
+			};
 		},
 
 		renderCall: (args, theme) => renderSubagentCall(args as Record<string, unknown>, theme),
@@ -579,9 +642,9 @@ export default function (pi: ExtensionAPI): void {
 		name: "subagent_decide",
 		label: "Decide Subagent Fate",
 		description:
-			"decide what happens to a subagent instance after a delivery: \"keep\" retains the resident process and " +
-			"its context for follow-up exchanges; \"drop\" kills it and deletes its files. " +
-			"Mandatory after every subagent delivery; undecided instances are dropped automatically when the run ends.",
+			"decide what happens to a subagent instance after its result has been read via subagent_check: " +
+			"\"keep\" retains the resident process and its context for follow-up exchanges; \"drop\" kills it and deletes its files. " +
+			"Mandatory after every subagent_check of a finished instance; undecided instances are dropped automatically when the run ends.",
 		promptSnippet: "keep or drop a delivered subagent instance",
 		parameters: Type.Object({
 			instance: Type.String({ description: "Instance id from the subagent tool result." }),
@@ -620,8 +683,9 @@ export default function (pi: ExtensionAPI): void {
 		description:
 			"Interrupt a running subagent WITHOUT killing it: aborts its current task but keeps the process and " +
 			"its full context alive, so you can then continue it with new instructions via subagent({ instance, task }) " +
-			"or drop it via subagent_decide. Mainly for background instances stuck in loops or heading the wrong way. " +
-			"(Foreground dispatches block you; those are interrupted by the user pressing Esc.)",
+			"or drop it via subagent_decide. Mainly for instances stuck in loops or heading the wrong way. " +
+			"(Subagents are decoupled from the main agent: the user interrupting YOU with Esc never affects them — " +
+			"this tool is the only way to interrupt one.)",
 		promptSnippet: "interrupt a running subagent, keeping its process and context alive",
 		parameters: Type.Object({
 			instance: Type.String({ description: "Instance id of the running subagent to interrupt." }),
@@ -639,6 +703,18 @@ export default function (pi: ExtensionAPI): void {
 			// fire as soon as the child's run ends, and it must skip the wake-up.
 			instance.abortInitiated = true;
 			await instance.client.abort();
+			// Retire the old run handler before returning: RPC abort resolves when
+			// the session is idle, but our own idle polling may still be in flight.
+			// Without this wait, an immediate continuation would stack a second run
+			// handler on the same event stream (split output, stolen abort flags,
+			// premature notifications). Bounded: a prompt that never started a run
+			// (extension command) retires via the watchdog within seconds, and the
+			// timeout is the last-resort guarantee against wedging this tool.
+			await Promise.race([
+				instance.runPromise?.catch(() => undefined),
+				new Promise((resolve) => setTimeout(resolve, 15_000)),
+			]);
+			instance.meta.lastError = "Run aborted by the main agent; no result was produced.";
 			instance.meta.status = "awaiting_decision";
 			currentPool.saveMeta(instance);
 
@@ -655,11 +731,92 @@ export default function (pi: ExtensionAPI): void {
 	});
 
 	pi.registerTool({
+		name: "subagent_check",
+		label: "Check Subagent Result",
+		description:
+			"Fetch the result of a subagent instance and mark it as read. This is the ONLY way results are " +
+			"delivered: completion notifications are light pings, the full output lives here. " +
+			"Works for finished (awaiting decision), interrupted (recovered) and kept instances; for a still-running " +
+			"instance it reports progress instead. After reading a finished result you MUST keep or drop it via subagent_decide.",
+		promptSnippet: "fetch a subagent's result and mark it read",
+		parameters: Type.Object({
+			instance: Type.String({ description: "Instance id to check (exact id or the unique name suffix)." }),
+		}),
+
+		async execute(_toolCallId, params, _signal, _onUpdate, context) {
+			const currentPool = ensurePool(context);
+			const instance = resolveInstance(currentPool, params.instance);
+			if (!instance) throw new Error(`No subagent instance "${params.instance}" in this session. Use subagent_list to inspect.`);
+
+			if (instance.meta.status === "running") {
+				return {
+					content: [{
+						type: "text" as const,
+						text: `Subagent "${instance.meta.id}" is still running. You will be notified when it completes; there is no result to read yet.`,
+					}],
+					details: {
+						instanceId: instance.meta.id,
+						agent: instance.meta.agent,
+						displayItems: instance.displayItems,
+						finalOutput: "",
+						usage: instance.usage,
+						status: "running",
+					},
+				};
+			}
+
+			// Reading the result consumes the unread mark: the settle sweep may
+			// reclaim this instance once the current run ends without a decision.
+			instance.meta.unread = false;
+			currentPool.saveMeta(instance);
+
+			if (instance.meta.status === "recovered") {
+				return {
+					content: [{
+						type: "text" as const,
+						text: `Subagent "${instance.meta.id}" was interrupted and has no result.\n` +
+							(instance.meta.lastError ? `Last error: ${instance.meta.lastError}\n` : "") +
+							`Its context is preserved on disk. Resume it with subagent({ instance: "${instance.meta.id}", task }) ` +
+							`or drop it with subagent_decide({ instance: "${instance.meta.id}", decision: "drop" }).`,
+					}],
+					details: {
+						instanceId: instance.meta.id,
+						agent: instance.meta.agent,
+						displayItems: instance.displayItems,
+						finalOutput: "",
+						usage: instance.usage,
+						status: "recovered",
+						isError: true,
+					},
+					isError: true,
+				};
+			}
+
+			const output = instance.finalOutput
+				|| (instance.meta.lastError ? `No result was produced. ${instance.meta.lastError}` : "(subagent produced no text output)");
+			return {
+				content: [{ type: "text" as const, text: output + decisionInstruction(instance.meta.id) }],
+				details: {
+					instanceId: instance.meta.id,
+					agent: instance.meta.agent,
+					displayItems: instance.displayItems,
+					finalOutput: output,
+					usage: instance.usage,
+				},
+			};
+		},
+
+		renderCall: (args, theme) => renderSubagentCall(args as Record<string, unknown>, theme),
+		renderResult: (result, { expanded }, theme) => renderSubagentResult(result, { expanded }, theme),
+	});
+
+	pi.registerTool({
 		name: "subagent_list",
 		label: "List Subagents",
 		description:
 			"List the subagent instances of the current session with their status " +
-			"(running / awaiting decision / kept / recovered leftover) and whether the process is alive.",
+			"(running / awaiting decision / kept / recovered leftover), whether the process is alive, " +
+			"and an UNREAD marker on results not yet fetched via subagent_check.",
 		promptSnippet: "list the subagent instances of the current session",
 		parameters: Type.Object({}),
 
@@ -670,7 +827,8 @@ export default function (pi: ExtensionAPI): void {
 				? ["Instances: none"]
 				: ["Instances:", ...instances.map((i) => {
 						const live = i.client?.alive ? "resident" : "no process";
-						return `  ${i.meta.id} [${i.meta.status}, ${live}] agent=${i.meta.agent} task="${truncate(i.meta.task, 80)}"`;
+						const unread = i.meta.unread ? " UNREAD (call subagent_check)" : "";
+						return `  ${i.meta.id} [${i.meta.status}, ${live}${unread}] agent=${i.meta.agent} task="${truncate(i.meta.task, 80)}"`;
 					})];
 			return { content: [{ type: "text" as const, text: lines.join("\n") }], details: {} };
 		},
@@ -709,10 +867,7 @@ export default function (pi: ExtensionAPI): void {
 
 	// A new run means queued follow-up notifications have been consumed: from
 	// now on the sweep may reclaim those instances if the model never decides.
-	pi.on("agent_start", () => {
-		if (!pool) return;
-		for (const instance of pool.list()) instance.notificationPending = false;
-	});
+	// (Unread results are spared by the sweep; see pool.sweepUndecided.)
 
 	pi.on("agent_settled", () => {
 		// Hard guarantee behind the mandatory keep/drop question. The sweep must
@@ -724,6 +879,10 @@ export default function (pi: ExtensionAPI): void {
 
 	// Best-effort child reaping when the main process goes away. A force-kill of
 	// the parent cannot be intercepted, but crash recovery covers that case.
+	// Headless children CANNOT outlive the parent anyway: the RPC transport is
+	// a parent-owned pipe, and 0.85.x treats stdin EOF as session shutdown.
+	// So reaping is unconditional in every mode; print/json leftovers are
+	// recovered from disk by the next session.
 	const killAll = () => pool?.killAll();
 	process.on("exit", killAll);
 	// Signals: registering a plain listener would SWALLOW Ctrl+C (Node drops its
@@ -751,7 +910,7 @@ export default function (pi: ExtensionAPI): void {
 			// UI teardown must never block process cleanup.
 		}
 		widget = undefined;
-		pool?.killAll();
+		killAll();
 	});
 
 	installations[SLOT] = () => {
@@ -764,7 +923,7 @@ export default function (pi: ExtensionAPI): void {
 			// The context may already be invalidated (reload ordering).
 		} finally {
 			widget = undefined;
-			pool?.killAll();
+			killAll();
 			pool = undefined;
 			ctx = undefined;
 		}
