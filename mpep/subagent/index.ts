@@ -18,13 +18,15 @@
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { isPluginEnabled } from "../manager/preferences.ts";
-import { discoverAgents, seedTemplateIfEmpty, type AgentConfig } from "./agents.ts";
+import { discoverAgents, seedPresets, type AgentConfig } from "./agents.ts";
 import { RpcSubprocess } from "./client.ts";
 import { emptyUsage, InstancePool, type Instance } from "./pool.ts";
 import { ensureSubagentDirs, instanceDir } from "./paths.ts";
+import { describeSchema } from "./schema.ts";
 import {
 	aggregateUsage,
 	extractFinalText,
@@ -50,42 +52,93 @@ export default function (pi: ExtensionAPI): void {
 	installations[SLOT]?.();
 
 	ensureSubagentDirs();
-	seedTemplateIfEmpty();
+	seedPresets();
+
+	/** Absolute path of the child-side companion extension (this plugin ships it). */
+	const childExtensionPath = fileURLToPath(new URL("./child-output.ts", import.meta.url));
 
 	let ctx: ExtensionContext | undefined;
 	let pool: InstancePool | undefined;
+	let poolSessionId = "";
 	let pendingReminder: string | undefined;
 
-	/** The pool is keyed by main session; rebuild it whenever the session changes. */
+	// Key the pool by SESSION ID, never by context identity: pi hands a fresh
+	// ExtensionContext object to each tool call, so comparing context references
+	// would silently rebuild (and empty) the pool on every call.
 	function ensurePool(context: ExtensionContext): InstancePool {
 		const sessionId = context.sessionManager.getSessionId() || `pid-${process.pid}`;
-		if (!pool || context !== ctx) {
-			ctx = context;
+		if (!pool || poolSessionId !== sessionId) {
 			pool = new InstancePool(sessionId);
+			poolSessionId = sessionId;
 		}
+		ctx = context;
 		return pool;
 	}
 
-	function buildSpawnArgs(agent: AgentConfig, instance: Instance, cwd: string, inheritThinking: string): string[] {
+	function buildSpawn(
+		agent: AgentConfig,
+		instance: Instance,
+		cwd: string,
+		inheritThinking: string,
+		inheritModel?: string,
+	): { args: string[]; env?: Record<string, string> } {
 		const args = [
 			"--mode", "rpc",
 			"--no-extensions", // no plugin discovery: prevents recursive subagent loading
 			"--session-dir", instance.dir,
 			"--session-id", instance.meta.sessionId,
 		];
-		if (agent.model) args.push("--model", agent.model);
+		// Omitted in the .md means "inherit the dispatching session", for both
+		// model and thinking level; without --model the child would fall back to
+		// pi's global default instead of the session's current model.
+		const model = agent.model ?? inheritModel;
+		if (model) args.push("--model", model);
 		args.push("--thinking", agent.thinking ?? inheritThinking);
-		if (agent.tools) args.push("--tools", agent.tools.join(","));
-		if (agent.excludeTools) args.push("--exclude-tools", agent.excludeTools.join(","));
+		if (agent.tools) {
+			// The structured-output channel must survive the allowlist: --tools
+			// applies to extension tools too, so submit_result has to be in it.
+			const tools = agent.output && !agent.tools.includes("submit_result")
+				? [...agent.tools, "submit_result"]
+				: agent.tools;
+			args.push("--tools", tools.join(","));
+		}
+		if (agent.excludeTools) {
+			args.push("--exclude-tools", agent.excludeTools.filter((t) => t !== "submit_result").join(","));
+		}
 		for (const extension of agent.extensions) {
 			args.push("--extension", path.resolve(cwd, extension));
 		}
-		if (agent.systemPrompt.trim()) {
+
+		// Structured output: load the companion extension into the child and hand
+		// it the schema + output path through the environment.
+		let env: Record<string, string> | undefined;
+		if (agent.output) {
+			args.push("--extension", childExtensionPath);
+			env = {
+				MPEP_SUBAGENT_SCHEMA: JSON.stringify(agent.output),
+				MPEP_SUBAGENT_OUTPUT: path.join(instance.dir, "output.json"),
+			};
+		}
+
+		const promptBody = agent.output
+			? `${agent.systemPrompt}\n\n<structured-output>\nWhen the task is complete you MUST call the submit_result tool exactly once. ` +
+				`Its parameters are your deliverable; do not also repeat them in prose. Required format:\n${describeSchema(agent.output)}\n</structured-output>`
+			: agent.systemPrompt;
+		if (promptBody.trim()) {
 			const promptFile = path.join(instance.dir, "prompt.md");
-			fs.writeFileSync(promptFile, agent.systemPrompt, "utf-8");
+			fs.writeFileSync(promptFile, promptBody, "utf-8");
 			args.push("--append-system-prompt", promptFile);
 		}
-		return args;
+		return { args, env };
+	}
+
+	/** Read and parse the child's submitted output.json; undefined when absent/invalid. */
+	function readSubmittedOutput(instance: Instance): unknown {
+		try {
+			return JSON.parse(fs.readFileSync(path.join(instance.dir, "output.json"), "utf-8"));
+		} catch {
+			return undefined;
+		}
 	}
 
 	/** Run one prompt on a live client, streaming progress via onUpdate. */
@@ -166,9 +219,9 @@ export default function (pi: ExtensionAPI): void {
 	}
 
 	const DECISION_INSTRUCTION =
-		"\n\n---\nREQUIRED: before finishing your turn, call subagent_decide with this instance id and " +
-		"decision \"keep\" (retain it for exactly one follow-up exchange) or \"drop\" (delete it). " +
-		"If you do not decide, it is dropped automatically at turn end.";
+		"\n\n---\nREQUIRED: before finishing your current run, call subagent_decide with this instance id and " +
+		"decision \"keep\" (retain it for follow-up exchanges) or \"drop\" (delete it). " +
+		"If you have not decided by the time your run ends, it is dropped automatically.";
 
 	function resultFor(instance: Instance, output: string, isError = false) {
 		return {
@@ -213,6 +266,7 @@ export default function (pi: ExtensionAPI): void {
 			const currentPool = ensurePool(context);
 			const task = params.task;
 			let instance: Instance | undefined;
+			let agentConfig: AgentConfig | undefined;
 
 			if (params.instance) {
 				// Continue an existing instance: resident process if kept, otherwise
@@ -224,11 +278,12 @@ export default function (pi: ExtensionAPI): void {
 				if (instance.meta.status === "running") {
 					throw new Error(`Subagent instance "${instance.meta.id}" is still running its previous task.`);
 				}
-				const agent = discoverAgents().find((a) => a.name === instance!.meta.agent);
+				agentConfig = discoverAgents().find((a) => a.name === instance!.meta.agent);
 				if (!instance.client || !instance.client.alive) {
-					if (!agent) throw new Error(`Agent definition "${instance.meta.agent}" no longer exists; cannot respawn.`);
+					if (!agentConfig) throw new Error(`Agent definition "${instance.meta.agent}" no longer exists; cannot respawn.`);
 					fs.mkdirSync(instance.dir, { recursive: true });
-					const client = new RpcSubprocess(context.cwd, buildSpawnArgs(agent, instance, context.cwd, context.thinkingLevel ?? "off"));
+					const { args, env } = buildSpawn(agentConfig, instance, context.cwd, context.thinkingLevel ?? "off", context.model ? `${context.model.provider}/${context.model.id}` : undefined);
+					const client = new RpcSubprocess(context.cwd, args, env);
 					await client.start();
 					instance.client = client;
 				}
@@ -262,7 +317,9 @@ export default function (pi: ExtensionAPI): void {
 				};
 				currentPool.add(instance);
 				currentPool.saveMeta(instance);
-				const client = new RpcSubprocess(context.cwd, buildSpawnArgs(agent, instance, context.cwd, context.thinkingLevel ?? "off"));
+				agentConfig = agent;
+				const { args, env } = buildSpawn(agent, instance, context.cwd, context.thinkingLevel ?? "off", context.model ? `${context.model.provider}/${context.model.id}` : undefined);
+				const client = new RpcSubprocess(context.cwd, args, env);
 				try {
 					await client.start();
 				} catch (error) {
@@ -279,12 +336,40 @@ export default function (pi: ExtensionAPI): void {
 			instance.displayItems = [];
 			currentPool.saveMeta(instance);
 
+			// A kept instance may hold a previous run's submission; clear it so a
+			// stale file is never mistaken for this run's deliverable.
+			if (agentConfig?.output) {
+				fs.rmSync(path.join(instance.dir, "output.json"), { force: true });
+			}
+
 			try {
 				const outcome = await runPrompt(instance, task, signal ?? undefined, onUpdate);
-				instance.finalOutput = outcome.finalOutput;
+				let output = outcome.finalOutput;
+
+				if (agentConfig?.output) {
+					let submitted = readSubmittedOutput(instance);
+					if (submitted === undefined) {
+						// The child ended without submit_result: one explicit reminder
+						// round-trip, then fall back to its raw text.
+						await runPrompt(
+							instance,
+							"You finished without calling submit_result. Call submit_result exactly once now, with the required fields.",
+							signal ?? undefined,
+							onUpdate,
+						);
+						submitted = readSubmittedOutput(instance);
+					}
+					if (submitted !== undefined) {
+						output = JSON.stringify(submitted, null, 2);
+					} else if (output.trim()) {
+						output = `${output}\n\n(note: the subagent did not submit the structured result; above is its raw text output)`;
+					}
+				}
+
+				instance.finalOutput = output;
 				instance.meta.status = "awaiting_decision";
 				currentPool.saveMeta(instance);
-				return resultFor(instance, outcome.finalOutput || "(subagent produced no text output)");
+				return resultFor(instance, output || "(subagent produced no text output)");
 			} catch (error) {
 				// Aborted or crashed mid-run: the session file stays on disk and the
 				// instance becomes a leftover the main agent can resume or drop.
@@ -303,9 +388,9 @@ export default function (pi: ExtensionAPI): void {
 		name: "subagent_decide",
 		label: "Decide Subagent Fate",
 		description:
-			"Decide what happens to a subagent instance after a delivery: \"keep\" retains the resident process and " +
-			"its context for exactly one follow-up exchange; \"drop\" kills it and deletes its files. " +
-			"Mandatory after every subagent delivery; undecided instances are dropped automatically at turn end.",
+			"decide what happens to a subagent instance after a delivery: \"keep\" retains the resident process and " +
+			"its context for follow-up exchanges; \"drop\" kills it and deletes its files. " +
+			"Mandatory after every subagent delivery; undecided instances are dropped automatically when the run ends.",
 		promptSnippet: "keep or drop a delivered subagent instance",
 		parameters: Type.Object({
 			instance: Type.String({ description: "Instance id from the subagent tool result." }),
@@ -364,7 +449,8 @@ export default function (pi: ExtensionAPI): void {
 
 	pi.on("session_start", (_event, context) => {
 		ctx = context;
-		pool = new InstancePool(context.sessionManager.getSessionId() || `pid-${process.pid}`);
+		poolSessionId = context.sessionManager.getSessionId() || `pid-${process.pid}`;
+		pool = new InstancePool(poolSessionId);
 		const recovered = pool.recoverFromDisk();
 		pendingReminder = recovered.length === 0
 			? undefined
@@ -384,9 +470,11 @@ export default function (pi: ExtensionAPI): void {
 		event.systemPromptOptions.appendSystemPrompt = `${event.systemPromptOptions.appendSystemPrompt ?? ""}\n\n${reminder}`;
 	});
 
-	pi.on("turn_end", () => {
-		// Hard guarantee behind the mandatory keep/drop question: an undecided
-		// instance is disposable by definition, so sweep it.
+	pi.on("agent_settled", () => {
+		// Hard guarantee behind the mandatory keep/drop question. The sweep must
+		// wait for the whole run (not turn_end): a delivery and its decide call
+		// land in DIFFERENT turns of the same run, so sweeping at turn_end would
+		// drop every instance before the model gets a chance to decide.
 		pool?.sweepUndecided();
 	});
 

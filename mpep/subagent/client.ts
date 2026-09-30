@@ -65,13 +65,15 @@ export class RpcSubprocess {
 	private stderrTail: string[] = [];
 	private readonly cwd: string;
 	private readonly args: string[];
+	private readonly env: Record<string, string> | undefined;
 
 	/** The subprocess is considered dead once close fires. */
 	alive = false;
 
-	constructor(cwd: string, args: string[]) {
+	constructor(cwd: string, args: string[], env?: Record<string, string>) {
 		this.cwd = cwd;
 		this.args = args;
+		this.env = env;
 	}
 
 	onEvent(listener: (event: RpcEvent) => void): () => void {
@@ -93,6 +95,7 @@ export class RpcSubprocess {
 			cwd: this.cwd,
 			shell: false,
 			stdio: ["pipe", "pipe", "pipe"],
+			env: this.env ? { ...process.env, ...this.env } : process.env,
 		});
 		this.proc = proc;
 		this.alive = true;
@@ -104,6 +107,14 @@ export class RpcSubprocess {
 		});
 		proc.on("error", () => this.handleClose(null));
 		proc.on("close", (code) => this.handleClose(code));
+
+		// The child must not hold the parent's event loop open: in print mode the
+		// main process exits right after the run even when an instance is kept
+		// resident. Unref everything; the exit handler still reaps children.
+		proc.unref();
+		for (const stream of [proc.stdin, proc.stdout, proc.stderr]) {
+			(stream as unknown as { unref?: () => void } | null)?.unref?.();
+		}
 
 		// Wait until the RPC loop answers. Startup includes config/auth loading
 		// and can take a moment; give it room but fail eventually.
