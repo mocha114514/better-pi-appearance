@@ -186,4 +186,6 @@ export const en = {
   "plugin.user-bubble.desc": "Replaces the full-width solid background block of user messages with a clean, modern colored rounded border",
   "stderr.commandDesc": "View intercepted third-party library stderr logs in a terminal modal",
   "stderr.empty": "No stderr output has been captured. System is clean.",
+  "subagent.indicator": "{count} subagents",
+  "subagent.overlayTitle": "Subagents",
 } as const;

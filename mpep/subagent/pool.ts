@@ -30,6 +30,9 @@ export interface InstanceMeta {
 	/** Pi session id (uuid); the session file is <dir>/<sessionId>.jsonl. */
 	sessionId: string;
 	task: string;
+	/** Resolved spawn-time values (inheritance already applied); for display. */
+	model?: string;
+	thinking?: string;
 	createdAt: number;
 	updatedAt: number;
 	status: InstanceStatus;
@@ -54,8 +57,19 @@ export function emptyUsage(): UsageStats {
 
 export class InstancePool {
 	private instances = new Map<string, Instance>();
+	private listeners = new Set<() => void>();
 
 	constructor(private readonly mainSessionId: string) {}
+
+	/** Subscribe to pool mutations (add/drop/status change/recovery). */
+	onChange(listener: () => void): () => void {
+		this.listeners.add(listener);
+		return () => this.listeners.delete(listener);
+	}
+
+	private emit(): void {
+		for (const listener of this.listeners) listener();
+	}
 
 	get(id: string): Instance | undefined {
 		return this.instances.get(id);
@@ -67,6 +81,7 @@ export class InstancePool {
 
 	add(instance: Instance): void {
 		this.instances.set(instance.meta.id, instance);
+		this.emit();
 	}
 
 	/** Persist meta.json so crash recovery can rebuild the pool from disk. */
@@ -78,6 +93,7 @@ export class InstancePool {
 		} catch {
 			// Metadata is a recovery aid; never fail the tool over it.
 		}
+		this.emit();
 	}
 
 	/** Kill the process if alive, delete the directory, forget the instance. */
@@ -100,6 +116,7 @@ export class InstancePool {
 			// Directory removal is best-effort; a leftover dir is recoverable.
 		}
 		this.instances.delete(id);
+		this.emit();
 		return true;
 	}
 
@@ -163,6 +180,7 @@ export class InstancePool {
 			this.instances.set(meta.id, instance);
 			recovered.push(instance);
 		}
+		if (recovered.length > 0) this.emit();
 		return recovered;
 	}
 }

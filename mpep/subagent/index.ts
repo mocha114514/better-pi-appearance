@@ -27,6 +27,7 @@ import { RpcSubprocess } from "./client.ts";
 import { emptyUsage, InstancePool, type Instance } from "./pool.ts";
 import { ensureSubagentDirs, instanceDir } from "./paths.ts";
 import { describeSchema } from "./schema.ts";
+import { installSubagentWidget, type SubagentWidgetController } from "./widget.ts";
 import {
 	aggregateUsage,
 	extractFinalText,
@@ -61,6 +62,7 @@ export default function (pi: ExtensionAPI): void {
 	let pool: InstancePool | undefined;
 	let poolSessionId = "";
 	let pendingReminder: string | undefined;
+	let widget: SubagentWidgetController | undefined;
 
 	// Key the pool by SESSION ID, never by context identity: pi hands a fresh
 	// ExtensionContext object to each tool call, so comparing context references
@@ -81,7 +83,7 @@ export default function (pi: ExtensionAPI): void {
 		cwd: string,
 		inheritThinking: string,
 		inheritModel?: string,
-	): { args: string[]; env?: Record<string, string> } {
+	): { args: string[]; env?: Record<string, string>; model?: string; thinking: string } {
 		const args = [
 			"--mode", "rpc",
 			"--no-extensions", // no plugin discovery: prevents recursive subagent loading
@@ -92,8 +94,9 @@ export default function (pi: ExtensionAPI): void {
 		// model and thinking level; without --model the child would fall back to
 		// pi's global default instead of the session's current model.
 		const model = agent.model ?? inheritModel;
+		const thinking = agent.thinking ?? inheritThinking;
 		if (model) args.push("--model", model);
-		args.push("--thinking", agent.thinking ?? inheritThinking);
+		args.push("--thinking", thinking);
 		if (agent.tools) {
 			// The structured-output channel must survive the allowlist: --tools
 			// applies to extension tools too, so submit_result has to be in it.
@@ -129,7 +132,7 @@ export default function (pi: ExtensionAPI): void {
 			fs.writeFileSync(promptFile, promptBody, "utf-8");
 			args.push("--append-system-prompt", promptFile);
 		}
-		return { args, env };
+		return { args, env, model, thinking };
 	}
 
 	/** Read and parse the child's submitted output.json; undefined when absent/invalid. */
@@ -282,8 +285,10 @@ export default function (pi: ExtensionAPI): void {
 				if (!instance.client || !instance.client.alive) {
 					if (!agentConfig) throw new Error(`Agent definition "${instance.meta.agent}" no longer exists; cannot respawn.`);
 					fs.mkdirSync(instance.dir, { recursive: true });
-					const { args, env } = buildSpawn(agentConfig, instance, context.cwd, context.thinkingLevel ?? "off", context.model ? `${context.model.provider}/${context.model.id}` : undefined);
-					const client = new RpcSubprocess(context.cwd, args, env);
+					const spawnPlan = buildSpawn(agentConfig, instance, context.cwd, context.thinkingLevel ?? "off", context.model ? `${context.model.provider}/${context.model.id}` : undefined);
+					instance.meta.model = spawnPlan.model;
+					instance.meta.thinking = spawnPlan.thinking;
+					const client = new RpcSubprocess(context.cwd, spawnPlan.args, spawnPlan.env);
 					await client.start();
 					instance.client = client;
 				}
@@ -318,8 +323,10 @@ export default function (pi: ExtensionAPI): void {
 				currentPool.add(instance);
 				currentPool.saveMeta(instance);
 				agentConfig = agent;
-				const { args, env } = buildSpawn(agent, instance, context.cwd, context.thinkingLevel ?? "off", context.model ? `${context.model.provider}/${context.model.id}` : undefined);
-				const client = new RpcSubprocess(context.cwd, args, env);
+				const spawnPlan = buildSpawn(agent, instance, context.cwd, context.thinkingLevel ?? "off", context.model ? `${context.model.provider}/${context.model.id}` : undefined);
+				instance.meta.model = spawnPlan.model;
+				instance.meta.thinking = spawnPlan.thinking;
+				const client = new RpcSubprocess(context.cwd, spawnPlan.args, spawnPlan.env);
 				try {
 					await client.start();
 				} catch (error) {
@@ -451,6 +458,9 @@ export default function (pi: ExtensionAPI): void {
 		ctx = context;
 		poolSessionId = context.sessionManager.getSessionId() || `pid-${process.pid}`;
 		pool = new InstancePool(poolSessionId);
+		// Rebind the presence widget to the fresh pool.
+		widget?.dispose();
+		widget = installSubagentWidget(context, pool);
 		const recovered = pool.recoverFromDisk();
 		pendingReminder = recovered.length === 0
 			? undefined
@@ -489,6 +499,8 @@ export default function (pi: ExtensionAPI): void {
 		process.off("exit", killAll);
 		process.off("SIGINT", killAll);
 		process.off("SIGTERM", killAll);
+		widget?.dispose();
+		widget = undefined;
 		pool?.killAll();
 		pool = undefined;
 		ctx = undefined;

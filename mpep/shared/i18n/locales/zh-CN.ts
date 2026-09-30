@@ -187,4 +187,6 @@ export const zhCN = {
   "plugin.user-bubble.desc": "将用户消息的整行深色实心色块替换为精致通透的彩色圆角边框包裹",
   "stderr.commandDesc": "在终端弹窗中查看被拦截捕获的第三方库 stderr 输出日志",
   "stderr.empty": "当前没有任何被拦截的 stderr 输出，系统运行良好。",
+  "subagent.indicator": "{count} 个子代理",
+  "subagent.overlayTitle": "子代理",
 } as const satisfies Record<keyof typeof en, string>;
