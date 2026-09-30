@@ -57,6 +57,11 @@ export default function (pi: ExtensionAPI): void {
 
 	/** Absolute path of the child-side companion extension (this plugin ships it). */
 	const childExtensionPath = fileURLToPath(new URL("./child-output.ts", import.meta.url));
+	/** Sibling plugin loaded into every subagent by default: pre-compaction
+	 * forewarning matters just as much in a child's context window. Its own
+	 * isPluginEnabled guard still applies, so disabling it in the plugin
+	 * manager disables it for subagents too. */
+	const compactForewarnPath = fileURLToPath(new URL("../compact-forewarn/index.ts", import.meta.url));
 
 	let ctx: ExtensionContext | undefined;
 	let pool: InstancePool | undefined;
@@ -98,18 +103,24 @@ export default function (pi: ExtensionAPI): void {
 		if (model) args.push("--model", model);
 		args.push("--thinking", thinking);
 		if (agent.tools) {
-			// The structured-output channel must survive the allowlist: --tools
-			// applies to extension tools too, so submit_result has to be in it.
-			const tools = agent.output && !agent.tools.includes("submit_result")
-				? [...agent.tools, "submit_result"]
-				: agent.tools;
-			args.push("--tools", tools.join(","));
+			// The allowlist applies to extension tools too, so the channels the
+			// child needs must survive it: submit_result (structured delivery)
+			// and request_compaction (compact-forewarn is loaded by default).
+			const tools = new Set(agent.tools);
+			if (agent.output) tools.add("submit_result");
+			tools.add("request_compaction");
+			args.push("--tools", [...tools].join(","));
 		}
 		if (agent.excludeTools) {
 			args.push("--exclude-tools", agent.excludeTools.filter((t) => t !== "submit_result").join(","));
 		}
+		// Default sibling extensions + the agent's own declared ones (deduped).
+		const extensionPaths = new Set<string>([compactForewarnPath]);
 		for (const extension of agent.extensions) {
-			args.push("--extension", path.resolve(cwd, extension));
+			extensionPaths.add(path.resolve(cwd, extension));
+		}
+		for (const extensionPath of extensionPaths) {
+			args.push("--extension", extensionPath);
 		}
 
 		// Structured output: load the companion extension into the child and hand
