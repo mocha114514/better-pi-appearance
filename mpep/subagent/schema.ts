@@ -31,11 +31,31 @@ export interface OutputSchemaNode {
 	metadata?: { description?: string };
 }
 
-/** Shallow sanity check: a usable schema is an object with at least one property. */
+/** Shallow sanity check: a usable schema is an object with properties. */
 export function isOutputSchema(value: unknown): value is OutputSchemaNode {
-	if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+	if (!isValidNode(value)) return false;
 	const props = (value as OutputSchemaNode).properties;
-	return props !== undefined && typeof props === "object" && props !== null && !Array.isArray(props);
+	return props !== undefined && Object.keys(props).length > 0;
+}
+
+/** Recursive validation: every node in the tree must be a well-formed object,
+ * or describeSchema/toTypeBox will dereference nulls mid-dispatch. */
+function isValidNode(node: unknown, depth = 0): boolean {
+	if (node === null || typeof node !== "object" || Array.isArray(node)) return false;
+	if (depth > 8) return false;
+	const n = node as Record<string, unknown>;
+	if (n.type !== undefined && typeof n.type !== "string") return false;
+	if (n.enum !== undefined && !Array.isArray(n.enum)) return false;
+	for (const key of ["properties", "optionalProperties"] as const) {
+		const group = n[key];
+		if (group === undefined) continue;
+		if (group === null || typeof group !== "object" || Array.isArray(group)) return false;
+		for (const child of Object.values(group)) {
+			if (!isValidNode(child, depth + 1)) return false;
+		}
+	}
+	if (n.elements !== undefined && !isValidNode(n.elements, depth + 1)) return false;
+	return true;
 }
 
 export function toTypeBox(node: OutputSchemaNode): TSchema {

@@ -19,8 +19,13 @@ import { join } from "node:path";
 import { getCacheDir } from "../shared/paths.ts";
 
 /** Session ids are uuids, but stay defensive: keep folder names filesystem-safe. */
-function sanitize(id: string): string {
+export function sanitizeId(id: string): string {
 	return id.replace(/[^a-zA-Z0-9_-]/g, "_");
+}
+
+/** Canonical directory identity (Windows filesystems are case-insensitive). */
+export function canonicalId(id: string): string {
+	return sanitizeId(id).toLowerCase();
 }
 
 export function subagentRoot(): string {
@@ -36,11 +41,11 @@ export function sessionsDir(): string {
 }
 
 export function mainSessionDir(mainSessionId: string): string {
-	return join(sessionsDir(), sanitize(mainSessionId));
+	return join(sessionsDir(), sanitizeId(mainSessionId));
 }
 
 export function instanceDir(mainSessionId: string, instanceId: string): string {
-	return join(mainSessionDir(mainSessionId), sanitize(instanceId));
+	return join(mainSessionDir(mainSessionId), sanitizeId(instanceId));
 }
 
 export function ensureSubagentDirs(): void {

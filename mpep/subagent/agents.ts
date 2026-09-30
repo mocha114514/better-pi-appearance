@@ -51,14 +51,19 @@ type AgentFrontmatter = {
 
 const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 
-/** Accept both `tools: read, bash` and `tools: [read, bash]`. Bad values yield undefined. */
+/**
+ * Accept both `tools: read, bash` and `tools: [read, bash]`. Absent or
+ * wrong-typed values yield undefined (no restriction); an explicitly empty
+ * list stays an empty list (restrict to nothing but mandatory channels).
+ */
 function parseStringList(value: unknown): string[] | undefined {
-	const raw = Array.isArray(value) ? value : typeof value === "string" ? value.split(",") : [];
-	const items = raw
+	if (value === undefined || value === null) return undefined;
+	if (!Array.isArray(value) && typeof value !== "string") return undefined;
+	const raw = Array.isArray(value) ? value : value.split(",");
+	return raw
 		.filter((v): v is string => typeof v === "string")
 		.map((v) => v.trim())
 		.filter(Boolean);
-	return items.length > 0 ? items : undefined;
 }
 
 function loadAgentFile(filePath: string): AgentConfig | undefined {
@@ -69,7 +74,14 @@ function loadAgentFile(filePath: string): AgentConfig | undefined {
 		return undefined;
 	}
 
-	const { frontmatter, body } = parseFrontmatter<AgentFrontmatter>(content);
+	// Malformed YAML in one user-editable file must not abort the whole scan.
+	let parsed: ReturnType<typeof parseFrontmatter<AgentFrontmatter>>;
+	try {
+		parsed = parseFrontmatter<AgentFrontmatter>(content);
+	} catch {
+		return undefined;
+	}
+	const { frontmatter, body } = parsed;
 	if (typeof frontmatter.name !== "string" || typeof frontmatter.description !== "string") {
 		return undefined;
 	}

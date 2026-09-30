@@ -50,6 +50,10 @@ export interface Instance {
 	/** Set when the main agent deliberately aborted this run: the background
 	 * completion handler consumes the flag and skips the wake-up notification. */
 	abortInitiated?: boolean;
+	/** Set when the completion notification has been queued for the main agent
+	 * but not yet consumed by a run; the settle sweep spares these instances so
+	 * a queued message never references a deleted instance. */
+	notificationPending?: boolean;
 }
 
 const META_FILE = "meta.json";
@@ -87,12 +91,17 @@ export class InstancePool {
 		this.emit();
 	}
 
-	/** Persist meta.json so crash recovery can rebuild the pool from disk. */
+	/** Persist meta.json so crash recovery can rebuild the pool from disk.
+	 * Written atomically (tmp + rename): a force-kill mid-write must never
+	 * leave a truncated meta behind, or recovery silently skips the instance. */
 	saveMeta(instance: Instance): void {
 		instance.meta.updatedAt = Date.now();
 		try {
 			fs.mkdirSync(instance.dir, { recursive: true });
-			fs.writeFileSync(path.join(instance.dir, META_FILE), `${JSON.stringify(instance.meta, null, 2)}\n`, "utf-8");
+			const target = path.join(instance.dir, META_FILE);
+			const tmp = `${target}.${process.pid}.tmp`;
+			fs.writeFileSync(tmp, `${JSON.stringify(instance.meta, null, 2)}\n`, "utf-8");
+			fs.renameSync(tmp, target);
 		} catch {
 			// Metadata is a recovery aid; never fail the tool over it.
 		}
@@ -123,11 +132,14 @@ export class InstancePool {
 		return true;
 	}
 
-	/** Drop every instance still awaiting a keep/drop decision. Returns dropped ids. */
+	/** Drop every instance still awaiting a keep/drop decision. Returns dropped ids.
+	 * Instances whose completion notification has been queued but not yet
+	 * consumed by a main-agent run are spared: deleting them first would orphan
+	 * the queued message (it references the instance the model must decide on). */
 	sweepUndecided(): string[] {
 		const dropped: string[] = [];
 		for (const instance of this.list()) {
-			if (instance.meta.status === "awaiting_decision") {
+			if (instance.meta.status === "awaiting_decision" && !instance.notificationPending) {
 				this.drop(instance.meta.id);
 				dropped.push(instance.meta.id);
 			}

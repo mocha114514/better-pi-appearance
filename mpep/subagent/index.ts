@@ -25,7 +25,7 @@ import { isPluginEnabled } from "../manager/preferences.ts";
 import { discoverAgents, seedPresets, type AgentConfig } from "./agents.ts";
 import { RpcSubprocess } from "./client.ts";
 import { emptyUsage, InstancePool, type Instance } from "./pool.ts";
-import { ensureSubagentDirs, instanceDir } from "./paths.ts";
+import { canonicalId, ensureSubagentDirs, instanceDir } from "./paths.ts";
 import { describeSchema } from "./schema.ts";
 import { installSubagentWidget, type SubagentWidgetController } from "./widget.ts";
 import {
@@ -164,17 +164,18 @@ export default function (pi: ExtensionAPI): void {
 		instance: Instance,
 		agentConfig: AgentConfig | undefined,
 		outcome: RunOutcome,
+		signal?: AbortSignal,
 	): Promise<string> {
 		let output = outcome.finalOutput;
 		if (!agentConfig?.output) return output;
 		let submitted = readSubmittedOutput(instance);
-		if (submitted === undefined) {
+		if (submitted === undefined && !signal?.aborted) {
 			// The child ended without submit_result: one explicit reminder
 			// round-trip, then fall back to its raw text.
 			await runPrompt(
 				instance,
 				"You finished without calling submit_result. Call submit_result exactly once now, with the required fields.",
-				undefined,
+				signal,
 				undefined,
 			);
 			submitted = readSubmittedOutput(instance);
@@ -193,16 +194,26 @@ export default function (pi: ExtensionAPI): void {
 	 */
 	function runInBackground(instance: Instance, agentConfig: AgentConfig | undefined, task: string, currentPool: InstancePool): void {
 		void (async () => {
+			// True while this instance is registered; drop() removes it, and any
+			// async continuation must then stay silent (no ghost writes, no ghost
+			// notifications about an instance the main agent already deleted).
+			const stillRegistered = () => currentPool.get(instance.meta.id) === instance;
 			try {
 				const outcome = await runPrompt(instance, task, undefined, undefined);
-				const output = await finalizeStructuredOutput(instance, agentConfig, outcome);
-				instance.finalOutput = output;
-				instance.meta.status = "awaiting_decision";
-				currentPool.saveMeta(instance);
+				// Deliberate abort: consume the run silently. The abort tool already
+				// moved the instance to awaiting_decision and told the main agent.
+				// Checked BEFORE finalization so no nudge prompt is sent either.
 				if (instance.abortInitiated) {
 					instance.abortInitiated = false;
-					return; // deliberate abort: the main agent already knows
+					return;
 				}
+				if (!stillRegistered()) return;
+				const output = await finalizeStructuredOutput(instance, agentConfig, outcome);
+				if (!stillRegistered()) return;
+				instance.finalOutput = output;
+				instance.meta.status = "awaiting_decision";
+				instance.notificationPending = true;
+				currentPool.saveMeta(instance);
 				pi.sendMessage(
 					{
 						customType: "mpep-subagent-result",
@@ -216,17 +227,23 @@ export default function (pi: ExtensionAPI): void {
 					instance.abortInitiated = false;
 					return;
 				}
+				if (!stillRegistered()) return;
 				instance.meta.status = "recovered";
 				currentPool.saveMeta(instance);
 				const message = error instanceof Error ? error.message : String(error);
-				pi.sendMessage(
-					{
+				try {
+					pi.sendMessage(
+						{
 						customType: "mpep-subagent-result",
 						display: false,
 						content: `Background subagent "${instance.meta.id}" (agent: ${instance.meta.agent}) was interrupted: ${message}\nIts context is preserved on disk. Resume it with subagent({ instance: "${instance.meta.id}", task }) or drop it with subagent_decide.`,
-					},
-					{ triggerTurn: true, deliverAs: "followUp" },
-				);
+						},
+						{ triggerTurn: true, deliverAs: "followUp" },
+					);
+				} catch {
+					// During reload/shutdown the old extension context is already
+					// invalidated; the leftover scan reports the instance anyway.
+				}
 			}
 		})();
 	}
@@ -240,9 +257,12 @@ export default function (pi: ExtensionAPI): void {
 	): Promise<RunOutcome> {
 		const client = instance.client;
 		if (!client) return Promise.reject(new Error("instance has no live process"));
+		// An already-aborted signal (e.g. Esc during startup) must not send the task.
+		if (signal?.aborted) return Promise.reject(new Error("aborted by user"));
 
 		return new Promise<RunOutcome>((resolve, reject) => {
 			let currentTextItem = "";
+			let lastMessages: unknown;
 			const pushToolItem = (text: string) => {
 				currentTextItem = "";
 				instance.displayItems.push({ type: "toolCall", text });
@@ -276,18 +296,28 @@ export default function (pi: ExtensionAPI): void {
 				} else if (event.type === "tool_execution_end" && event.isError) {
 					instance.displayItems.push({ type: "toolResult", text: String(event.toolName ?? ""), isError: true });
 				} else if (event.type === "agent_end") {
+					// NOT the finish line: retries and compaction continuations (e.g.
+					// the injected compact-forewarn) resume the child after agent_end.
+					// Accumulate usage per segment; the run truly ends at agent_settled.
+					lastMessages = event.messages;
+					const segment = aggregateUsage(event.messages);
+					instance.usage.turns += segment.turns;
+					instance.usage.input += segment.input;
+					instance.usage.output += segment.output;
+					instance.usage.cacheRead += segment.cacheRead;
+					instance.usage.cacheWrite += segment.cacheWrite;
+					instance.usage.cost += segment.cost;
+					instance.usage.contextTokens = segment.contextTokens;
+				} else if (event.type === "agent_settled") {
 					cleanup();
-					const messages = event.messages;
-					instance.usage = aggregateUsage(messages);
-					resolve({ finalOutput: extractFinalText(messages), messages });
+					resolve({ finalOutput: extractFinalText(lastMessages), messages: lastMessages });
 				}
 			});
 
-			const offExit = (code: number | null) => {
+			const offExit = client.onExit((code) => {
 				cleanup();
 				reject(new Error(`subagent process exited mid-run (code ${code}). ${client.stderrText()}`.trim()));
-			};
-			client.onExit(offExit);
+			});
 
 			const onAbort = () => {
 				cleanup();
@@ -297,6 +327,7 @@ export default function (pi: ExtensionAPI): void {
 			};
 			const cleanup = () => {
 				offEvent();
+				offExit();
 				signal?.removeEventListener("abort", onAbort);
 			};
 			signal?.addEventListener("abort", onAbort, { once: true });
@@ -324,7 +355,11 @@ export default function (pi: ExtensionAPI): void {
 			throw new Error(`Invalid subagent name "${trimmed}": use 1-64 characters of letters, digits, underscore or hyphen.`);
 		}
 		const id = `${agentName}-${trimmed}`;
-		if (pool.get(id)) {
+		// Directory identity is the real constraint: Windows filesystems are
+		// case-insensitive, so scout-Foo and scout-foo would silently share one
+		// directory (and one session file) if only the raw id were compared.
+		const idCanonical = canonicalId(id);
+		if (pool.list().some((i) => canonicalId(i.meta.id) === idCanonical)) {
 			throw new Error(`A living subagent instance "${id}" already exists; pick a different name.`);
 		}
 		return id;
@@ -417,12 +452,27 @@ export default function (pi: ExtensionAPI): void {
 				agentConfig = discoverAgents().find((a) => a.name === instance!.meta.agent);
 				if (!instance.client || !instance.client.alive) {
 					if (!agentConfig) throw new Error(`Agent definition "${instance.meta.agent}" no longer exists; cannot respawn.`);
+					// Reserve synchronously BEFORE the async startup: pi executes tool
+					// calls in parallel, and two continuations of one instance must not
+					// both spawn children onto the same session directory.
+					const previousStatus = instance.meta.status;
+					instance.meta.status = "running";
 					fs.mkdirSync(instance.dir, { recursive: true });
 					const spawnPlan = buildSpawn(agentConfig, instance, context.cwd, context.thinkingLevel ?? "off", context.model ? `${context.model.provider}/${context.model.id}` : undefined);
 					instance.meta.model = spawnPlan.model;
 					instance.meta.thinking = spawnPlan.thinking;
 					const client = new RpcSubprocess(context.cwd, spawnPlan.args, spawnPlan.env);
-					await client.start();
+					const onStartAbort = () => client.kill();
+					signal?.addEventListener("abort", onStartAbort, { once: true });
+					try {
+						await client.start();
+					} catch (error) {
+						instance.meta.status = previousStatus;
+						currentPool.saveMeta(instance);
+						throw error;
+					} finally {
+						signal?.removeEventListener("abort", onStartAbort);
+					}
 					instance.client = client;
 				}
 				instance.meta.task = task;
@@ -460,6 +510,8 @@ export default function (pi: ExtensionAPI): void {
 				instance.meta.model = spawnPlan.model;
 				instance.meta.thinking = spawnPlan.thinking;
 				const client = new RpcSubprocess(context.cwd, spawnPlan.args, spawnPlan.env);
+				const onStartAbort = () => client.kill();
+				signal?.addEventListener("abort", onStartAbort, { once: true });
 				try {
 					await client.start();
 				} catch (error) {
@@ -468,6 +520,8 @@ export default function (pi: ExtensionAPI): void {
 					instance.meta.status = "recovered";
 					currentPool.saveMeta(instance);
 					throw error;
+				} finally {
+					signal?.removeEventListener("abort", onStartAbort);
 				}
 				instance.client = client;
 			}
@@ -647,7 +701,17 @@ export default function (pi: ExtensionAPI): void {
 		if (!pendingReminder) return;
 		const reminder = pendingReminder;
 		pendingReminder = undefined;
-		event.systemPromptOptions.appendSystemPrompt = `${event.systemPromptOptions.appendSystemPrompt ?? ""}\n\n${reminder}`;
+		// Contract of the installed Pi (0.85.x): mutations of systemPromptOptions
+		// are ignored; the system prompt changes only via the returned value.
+		// (Newer Pi also honors the return contract, so this works on both.)
+		return { systemPrompt: `${event.systemPrompt}\n\n${reminder}` };
+	});
+
+	// A new run means queued follow-up notifications have been consumed: from
+	// now on the sweep may reclaim those instances if the model never decides.
+	pi.on("agent_start", () => {
+		if (!pool) return;
+		for (const instance of pool.list()) instance.notificationPending = false;
 	});
 
 	pi.on("agent_settled", () => {
@@ -662,18 +726,48 @@ export default function (pi: ExtensionAPI): void {
 	// the parent cannot be intercepted, but crash recovery covers that case.
 	const killAll = () => pool?.killAll();
 	process.on("exit", killAll);
-	process.on("SIGINT", killAll);
-	process.on("SIGTERM", killAll);
+	// Signals: registering a plain listener would SWALLOW Ctrl+C (Node drops its
+	// default termination once any listener exists). Reap, then re-raise so the
+	// default behavior (or the host's own handler) still runs.
+	const onSigint = () => {
+		process.off("SIGINT", onSigint);
+		killAll();
+		process.kill(process.pid, "SIGINT");
+	};
+	const onSigterm = () => {
+		process.off("SIGTERM", onSigterm);
+		killAll();
+		process.kill(process.pid, "SIGTERM");
+	};
+	process.on("SIGINT", onSigint);
+	process.on("SIGTERM", onSigterm);
+
+	// TUI reload / session replacement invalidates this context right after; all
+	// UI teardown must happen here while the context is still valid.
+	pi.on("session_shutdown", () => {
+		try {
+			widget?.dispose();
+		} catch {
+			// UI teardown must never block process cleanup.
+		}
+		widget = undefined;
+		pool?.killAll();
+	});
 
 	installations[SLOT] = () => {
 		process.off("exit", killAll);
-		process.off("SIGINT", killAll);
-		process.off("SIGTERM", killAll);
-		widget?.dispose();
-		widget = undefined;
-		pool?.killAll();
-		pool = undefined;
-		ctx = undefined;
+		process.off("SIGINT", onSigint);
+		process.off("SIGTERM", onSigterm);
+		try {
+			widget?.dispose();
+		} catch {
+			// The context may already be invalidated (reload ordering).
+		} finally {
+			widget = undefined;
+			pool?.killAll();
+			pool = undefined;
+			ctx = undefined;
+		}
 		if (installations[SLOT] !== undefined) delete installations[SLOT];
 	};
 }

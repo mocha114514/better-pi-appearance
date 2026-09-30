@@ -5,6 +5,7 @@
  */
 
 import { Text } from "@earendil-works/pi-tui";
+import type { ThemeColor } from "@earendil-works/pi-coding-agent";
 
 export interface DisplayItem {
 	type: "text" | "toolCall" | "toolResult";
@@ -117,7 +118,7 @@ export function extractFinalText(messages: unknown): string {
 }
 
 interface Theme {
-	fg(color: string, text: string): string;
+	fg(color: ThemeColor, text: string): string;
 	bold(text: string): string;
 }
 
@@ -164,7 +165,7 @@ export function renderSubagentResult(
 	if (!options.expanded) {
 		const items = details.displayItems.slice(-COLLAPSED_ITEM_COUNT);
 		const lines = items.map((item) => {
-			if (item.type === "toolCall") return theme.fg("tool", `  ${item.text}`);
+			if (item.type === "toolCall") return theme.fg("toolTitle", `  ${item.text}`);
 			if (item.type === "toolResult" && item.isError) return theme.fg("error", `  ⎿ ${truncate(item.text, 100)}`);
 			return theme.fg("muted", `  ${truncate(item.text, 120)}`);
 		});
@@ -174,7 +175,7 @@ export function renderSubagentResult(
 	}
 
 	const lines = details.displayItems.map((item) => {
-		if (item.type === "toolCall") return theme.fg("tool", `  ${item.text}`);
+		if (item.type === "toolCall") return theme.fg("toolTitle", `  ${item.text}`);
 		if (item.type === "toolResult" && item.isError) return theme.fg("error", `  ⎿ ${item.text}`);
 		return theme.fg("muted", `  ${item.text}`);
 	});
@@ -190,7 +191,7 @@ export function renderSubagentResult(
 export function renderStreamingItems(theme: Theme, header: string, items: DisplayItem[]): Text {
 	const tail = items.slice(-COLLAPSED_ITEM_COUNT);
 	const lines = tail.map((item) => {
-		if (item.type === "toolCall") return theme.fg("tool", `  ${item.text}`);
+		if (item.type === "toolCall") return theme.fg("toolTitle", `  ${item.text}`);
 		return theme.fg("muted", `  ${truncate(item.text, 120)}`);
 	});
 	return new Text(`${theme.fg("accent", "⏳")} ${header}\n${lines.join("\n")}`, 0, 0);
