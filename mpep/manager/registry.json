@@ -103,5 +103,12 @@
     "path": "./user-bubble/index.ts",
     "desc": "将用户消息的整行深色实心色块替换为精致通透的彩色圆角边框包裹",
     "enabled": true
+  },
+  {
+    "id": "subagent",
+    "name": "子代理委派 (subagent)",
+    "path": "./subagent/index.ts",
+    "desc": "以常驻 pi RPC 子进程跑隔离子代理，keep/drop 生命周期管理与崩溃残留恢复",
+    "enabled": true
   }
 ]

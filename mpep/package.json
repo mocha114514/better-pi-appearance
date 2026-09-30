@@ -27,6 +27,7 @@
       "./theme-distributor.ts",
       "./usage/index.ts",
       "./compact-forewarn/index.ts",
+      "./subagent/index.ts",
       "./export/index.ts",
       "./stderr-guard/index.ts",
       "./user-bubble/index.ts"
