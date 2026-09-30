@@ -144,6 +144,82 @@ export default function (pi: ExtensionAPI): void {
 		}
 	}
 
+	/**
+	 * Post-run structured-output handling shared by the foreground and
+	 * background paths: read output.json, nudge once when missing, then fall
+	 * back to the raw text.
+	 */
+	async function finalizeStructuredOutput(
+		instance: Instance,
+		agentConfig: AgentConfig | undefined,
+		outcome: RunOutcome,
+	): Promise<string> {
+		let output = outcome.finalOutput;
+		if (!agentConfig?.output) return output;
+		let submitted = readSubmittedOutput(instance);
+		if (submitted === undefined) {
+			// The child ended without submit_result: one explicit reminder
+			// round-trip, then fall back to its raw text.
+			await runPrompt(
+				instance,
+				"You finished without calling submit_result. Call submit_result exactly once now, with the required fields.",
+				undefined,
+				undefined,
+			);
+			submitted = readSubmittedOutput(instance);
+		}
+		if (submitted !== undefined) return JSON.stringify(submitted, null, 2);
+		if (output.trim()) {
+			output = `${output}\n\n(note: the subagent did not submit the structured result; above is its raw text output)`;
+		}
+		return output;
+	}
+
+	/**
+	 * Background completion path: the tool call already returned, so the
+	 * result is delivered as a queued follow-up message that wakes the main
+	 * agent (triggerTurn) after whatever it is currently doing (followUp).
+	 */
+	function runInBackground(instance: Instance, agentConfig: AgentConfig | undefined, task: string, currentPool: InstancePool): void {
+		void (async () => {
+			try {
+				const outcome = await runPrompt(instance, task, undefined, undefined);
+				const output = await finalizeStructuredOutput(instance, agentConfig, outcome);
+				instance.finalOutput = output;
+				instance.meta.status = "awaiting_decision";
+				currentPool.saveMeta(instance);
+				if (instance.abortInitiated) {
+					instance.abortInitiated = false;
+					return; // deliberate abort: the main agent already knows
+				}
+				pi.sendMessage(
+					{
+						customType: "mpep-subagent-result",
+						display: false,
+						content: `Background subagent "${instance.meta.id}" (agent: ${instance.meta.agent}) has finished.\n\n${output || "(no text output)"}${DECISION_INSTRUCTION}`,
+					},
+					{ triggerTurn: true, deliverAs: "followUp" },
+				);
+			} catch (error) {
+				if (instance.abortInitiated) {
+					instance.abortInitiated = false;
+					return;
+				}
+				instance.meta.status = "recovered";
+				currentPool.saveMeta(instance);
+				const message = error instanceof Error ? error.message : String(error);
+				pi.sendMessage(
+					{
+						customType: "mpep-subagent-result",
+						display: false,
+						content: `Background subagent "${instance.meta.id}" (agent: ${instance.meta.agent}) was interrupted: ${message}\nIts context is preserved on disk. Resume it with subagent({ instance: "${instance.meta.id}", task }) or drop it with subagent_decide.`,
+					},
+					{ triggerTurn: true, deliverAs: "followUp" },
+				);
+			}
+		})();
+	}
+
 	/** Run one prompt on a live client, streaming progress via onUpdate. */
 	function runPrompt(
 		instance: Instance,
@@ -253,16 +329,19 @@ export default function (pi: ExtensionAPI): void {
 			"Delegate a task to a specialized subagent running as an isolated resident Pi process. " +
 			"Start a new one with { agent, task }; continue an existing one with { instance, task }. " +
 			`Available agents: ${agentsSummary}. ` +
-			"After EVERY delivery you must call subagent_decide to keep or drop the instance.",
+			"After EVERY delivery you must call subagent_decide to keep or drop the instance. " +
+			"Set background: true for long-running tasks: the call returns immediately and the result arrives later as a follow-up message.",
 		promptSnippet: "delegate an isolated task to a specialized subagent process",
 		promptGuidelines: [
 			"After each subagent delivery, immediately call subagent_decide (keep or drop) for that instance.",
 			"Pass the instance id to continue a kept subagent instead of starting a new one.",
+			"Use background: true for long-running tasks; foreground dispatch blocks you until the subagent finishes.",
 		],
 		parameters: Type.Object({
 			agent: Type.Optional(Type.String({ description: "Agent name from a .md definition (required for a new instance)." })),
 			task: Type.String({ description: "The task or follow-up instruction for the subagent." }),
 			instance: Type.Optional(Type.String({ description: "Existing instance id to continue; omit to start fresh." })),
+			background: Type.Optional(Type.Boolean({ description: "Run asynchronously: return immediately and get the result via a follow-up message. Default false (block until done)." })),
 		}),
 
 		async execute(_toolCallId, params, signal, onUpdate, context) {
@@ -349,30 +428,27 @@ export default function (pi: ExtensionAPI): void {
 				fs.rmSync(path.join(instance.dir, "output.json"), { force: true });
 			}
 
+			if (params.background) {
+				runInBackground(instance, agentConfig, task, currentPool);
+				return {
+					content: [{
+						type: "text" as const,
+						text: `Subagent "${instance.meta.id}" is running in the background; you will be notified when it finishes. ` +
+							"You may keep working or end your turn now. To interrupt it early, call subagent_abort.",
+					}],
+					details: {
+						instanceId: instance.meta.id,
+						agent: instance.meta.agent,
+						displayItems: instance.displayItems,
+						finalOutput: "",
+						usage: instance.usage,
+					},
+				};
+			}
+
 			try {
 				const outcome = await runPrompt(instance, task, signal ?? undefined, onUpdate);
-				let output = outcome.finalOutput;
-
-				if (agentConfig?.output) {
-					let submitted = readSubmittedOutput(instance);
-					if (submitted === undefined) {
-						// The child ended without submit_result: one explicit reminder
-						// round-trip, then fall back to its raw text.
-						await runPrompt(
-							instance,
-							"You finished without calling submit_result. Call submit_result exactly once now, with the required fields.",
-							signal ?? undefined,
-							onUpdate,
-						);
-						submitted = readSubmittedOutput(instance);
-					}
-					if (submitted !== undefined) {
-						output = JSON.stringify(submitted, null, 2);
-					} else if (output.trim()) {
-						output = `${output}\n\n(note: the subagent did not submit the structured result; above is its raw text output)`;
-					}
-				}
-
+				const output = await finalizeStructuredOutput(instance, agentConfig, outcome);
 				instance.finalOutput = output;
 				instance.meta.status = "awaiting_decision";
 				currentPool.saveMeta(instance);
@@ -426,6 +502,46 @@ export default function (pi: ExtensionAPI): void {
 						"After the next delivery you must decide again; it is dropped automatically if you do not.",
 				}],
 				details: { instanceId: instance.meta.id, decision: "keep" },
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "subagent_abort",
+		label: "Abort Subagent Run",
+		description:
+			"Interrupt a running subagent WITHOUT killing it: aborts its current task but keeps the process and " +
+			"its full context alive, so you can then continue it with new instructions via subagent({ instance, task }) " +
+			"or drop it via subagent_decide. Mainly for background instances stuck in loops or heading the wrong way. " +
+			"(Foreground dispatches block you; those are interrupted by the user pressing Esc.)",
+		promptSnippet: "interrupt a running subagent, keeping its process and context alive",
+		parameters: Type.Object({
+			instance: Type.String({ description: "Instance id of the running subagent to interrupt." }),
+		}),
+
+		async execute(_toolCallId, params, _signal, _onUpdate, context) {
+			const currentPool = ensurePool(context);
+			const instance = currentPool.get(params.instance);
+			if (!instance) throw new Error(`No subagent instance "${params.instance}" in this session.`);
+			if (instance.meta.status !== "running" || !instance.client?.alive) {
+				throw new Error(`Subagent instance "${instance.meta.id}" is not running (status: ${instance.meta.status}).`);
+			}
+
+			// Set the flag BEFORE aborting: the background completion handler may
+			// fire as soon as the child's run ends, and it must skip the wake-up.
+			instance.abortInitiated = true;
+			await instance.client.abort();
+			instance.meta.status = "awaiting_decision";
+			currentPool.saveMeta(instance);
+
+			return {
+				content: [{
+					type: "text" as const,
+					text: `Subagent "${instance.meta.id}" aborted. Its process and context are intact. ` +
+						`Continue it with subagent({ instance: "${instance.meta.id}", task }) or drop it with subagent_decide.` +
+						DECISION_INSTRUCTION,
+				}],
+				details: { instanceId: instance.meta.id, aborted: true },
 			};
 		},
 	});

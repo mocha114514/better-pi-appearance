@@ -47,6 +47,9 @@ export interface Instance {
 	displayItems: DisplayItem[];
 	usage: UsageStats;
 	finalOutput: string;
+	/** Set when the main agent deliberately aborted this run: the background
+	 * completion handler consumes the flag and skips the wake-up notification. */
+	abortInitiated?: boolean;
 }
 
 const META_FILE = "meta.json";
