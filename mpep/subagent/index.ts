@@ -196,7 +196,7 @@ export default function (pi: ExtensionAPI): void {
 					{
 						customType: "mpep-subagent-result",
 						display: false,
-						content: `Background subagent "${instance.meta.id}" (agent: ${instance.meta.agent}) has finished.\n\n${output || "(no text output)"}${DECISION_INSTRUCTION}`,
+						content: `Background subagent "${instance.meta.id}" (agent: ${instance.meta.agent}) has finished.\n\n${output || "(no text output)"}${decisionInstruction(instance.meta.id)}`,
 					},
 					{ triggerTurn: true, deliverAs: "followUp" },
 				);
@@ -297,14 +297,49 @@ export default function (pi: ExtensionAPI): void {
 		});
 	}
 
-	const DECISION_INSTRUCTION =
-		"\n\n---\nREQUIRED: before finishing your current run, call subagent_decide with this instance id and " +
-		"decision \"keep\" (retain it for follow-up exchanges) or \"drop\" (delete it). " +
+	const INSTANCE_NAME_PATTERN = /^[a-zA-Z0-9_-]{1,64}$/;
+
+	/**
+	 * Compose the instance id as "<agent>-<name>". The name is chosen by the
+	 * main agent for readability; invalid characters are REJECTED rather than
+	 * sanitized, so the id the caller remembers always matches reality.
+	 * Uniqueness is enforced among living instances only: dead ids are
+	 * reusable (the directory is gone by then).
+	 */
+	function composeInstanceId(agentName: string, name: string | undefined, pool: InstancePool): string {
+		const trimmed = name?.trim();
+		if (!trimmed) return `${agentName}-${randomUUID().slice(0, 8)}`;
+		if (!INSTANCE_NAME_PATTERN.test(trimmed)) {
+			throw new Error(`Invalid subagent name "${trimmed}": use 1-64 characters of letters, digits, underscore or hyphen.`);
+		}
+		const id = `${agentName}-${trimmed}`;
+		if (pool.get(id)) {
+			throw new Error(`A living subagent instance "${id}" already exists; pick a different name.`);
+		}
+		return id;
+	}
+
+	/**
+	 * Resolve an instance reference. Exact id first; otherwise a unique
+	 * "<agent>-<ref>" suffix match. Models sometimes remember only the name
+	 * they chose, not the composed id — be forgiving on lookup (never on
+	 * creation, where ambiguity would bite later).
+	 */
+	function resolveInstance(pool: InstancePool, ref: string): Instance | undefined {
+		const exact = pool.get(ref);
+		if (exact) return exact;
+		const matches = pool.list().filter((i) => i.meta.id.endsWith(`-${ref}`));
+		return matches.length === 1 ? matches[0] : undefined;
+	}
+
+	const decisionInstruction = (id: string) =>
+		"\n\n---\nREQUIRED: before finishing your current run, call subagent_decide with " +
+		`instance "${id}" and decision "keep" (retain it for follow-up exchanges) or "drop" (delete it). ` +
 		"If you have not decided by the time your run ends, it is dropped automatically.";
 
 	function resultFor(instance: Instance, output: string, isError = false) {
 		return {
-			content: [{ type: "text" as const, text: output + (isError ? "" : DECISION_INSTRUCTION) }],
+			content: [{ type: "text" as const, text: output + (isError ? "" : decisionInstruction(instance.meta.id)) }],
 			details: {
 				instanceId: instance.meta.id,
 				agent: instance.meta.agent,
@@ -336,12 +371,20 @@ export default function (pi: ExtensionAPI): void {
 			"After each subagent delivery, immediately call subagent_decide (keep or drop) for that instance.",
 			"Pass the instance id to continue a kept subagent instead of starting a new one.",
 			"Use background: true for long-running tasks; foreground dispatch blocks you until the subagent finishes.",
+			"Name new instances meaningfully (snake_case via the name parameter), e.g. name: frontend_auth_investigation.",
 		],
 		parameters: Type.Object({
 			agent: Type.Optional(Type.String({ description: "Agent name from a .md definition (required for a new instance)." })),
 			task: Type.String({ description: "The task or follow-up instruction for the subagent." }),
 			instance: Type.Optional(Type.String({ description: "Existing instance id to continue; omit to start fresh." })),
 			background: Type.Optional(Type.Boolean({ description: "Run asynchronously: return immediately and get the result via a follow-up message. Default false (block until done)." })),
+			name: Type.Optional(Type.String({
+			description:
+				"Custom name for a NEW instance (ignored when continuing via instance). The full id becomes \"<agent>-<name>\". " +
+				"Pick a self-explanatory snake_case name describing the task, e.g. scout-frontend_auth_investigation. " +
+				"Allowed: letters, digits, underscore, hyphen; max 64 chars; must be unique among living instances. " +
+				"Omit for a random suffix.",
+			})),
 		}),
 
 		async execute(_toolCallId, params, signal, onUpdate, context) {
@@ -353,7 +396,7 @@ export default function (pi: ExtensionAPI): void {
 			if (params.instance) {
 				// Continue an existing instance: resident process if kept, otherwise
 				// respawn from the on-disk session (recovered leftovers).
-				instance = currentPool.get(params.instance);
+				instance = resolveInstance(currentPool, params.instance);
 				if (!instance) {
 					throw new Error(`No subagent instance "${params.instance}" in this session. Use subagent_list to inspect.`);
 				}
@@ -381,7 +424,7 @@ export default function (pi: ExtensionAPI): void {
 					const available = agents.map((a) => `${a.name}: ${a.description}`).join("\n") || "(none)";
 					throw new Error(`Unknown agent "${params.agent}". Available agents:\n${available}`);
 				}
-				const id = `${agent.name}-${randomUUID().slice(0, 8)}`;
+				const id = composeInstanceId(agent.name, params.name, currentPool);
 				const dir = instanceDir(context.sessionManager.getSessionId() || `pid-${process.pid}`, id);
 				fs.mkdirSync(dir, { recursive: true });
 				instance = {
@@ -482,7 +525,7 @@ export default function (pi: ExtensionAPI): void {
 
 		async execute(_toolCallId, params, _signal, _onUpdate, context) {
 			const currentPool = ensurePool(context);
-			const instance = currentPool.get(params.instance);
+			const instance = resolveInstance(currentPool, params.instance);
 			if (!instance) throw new Error(`No subagent instance "${params.instance}" in this session.`);
 
 			if (params.decision === "drop") {
@@ -521,7 +564,7 @@ export default function (pi: ExtensionAPI): void {
 
 		async execute(_toolCallId, params, _signal, _onUpdate, context) {
 			const currentPool = ensurePool(context);
-			const instance = currentPool.get(params.instance);
+			const instance = resolveInstance(currentPool, params.instance);
 			if (!instance) throw new Error(`No subagent instance "${params.instance}" in this session.`);
 			if (instance.meta.status !== "running" || !instance.client?.alive) {
 				throw new Error(`Subagent instance "${instance.meta.id}" is not running (status: ${instance.meta.status}).`);
@@ -539,7 +582,7 @@ export default function (pi: ExtensionAPI): void {
 					type: "text" as const,
 					text: `Subagent "${instance.meta.id}" aborted. Its process and context are intact. ` +
 						`Continue it with subagent({ instance: "${instance.meta.id}", task }) or drop it with subagent_decide.` +
-						DECISION_INSTRUCTION,
+						decisionInstruction(instance.meta.id),
 				}],
 				details: { instanceId: instance.meta.id, aborted: true },
 			};
