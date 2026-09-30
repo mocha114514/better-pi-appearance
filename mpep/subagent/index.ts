@@ -286,6 +286,7 @@ export default function (pi: ExtensionAPI): void {
 			let lastMessages: unknown;
 			let done = false;
 			let settleTimer: ReturnType<typeof setTimeout> | undefined;
+			let pollActive = false;
 			let sawRunStart = false;
 			let sawAgentEnd = false;
 			let idleStreak = 0;
@@ -352,8 +353,13 @@ export default function (pi: ExtensionAPI): void {
 			// (20 idle probes without agent_start ~ 10s) frees command-only prompts;
 			// the probe cap guarantees delivery even if the child wedges.
 			const confirmIdle = () => {
-				if (done) return;
+				// Single polling chain per run: prompt-accept AND every agent_settled
+				// may arm this, and concurrent chains would share (and burn) the
+				// probe budget N times faster.
+				if (done || pollActive) return;
+				pollActive = true;
 				settleTimer = setTimeout(() => {
+					pollActive = false;
 					void (async () => {
 						if (done) return;
 						try {
@@ -395,6 +401,7 @@ export default function (pi: ExtensionAPI): void {
 				offEvent();
 				offExit();
 				if (settleTimer) clearTimeout(settleTimer);
+				pollActive = false;
 				signal?.removeEventListener("abort", onAbort);
 			};
 			signal?.addEventListener("abort", onAbort, { once: true });
@@ -706,14 +713,40 @@ export default function (pi: ExtensionAPI): void {
 			// Retire the old run handler before returning: RPC abort resolves when
 			// the session is idle, but our own idle polling may still be in flight.
 			// Without this wait, an immediate continuation would stack a second run
-			// handler on the same event stream (split output, stolen abort flags,
-			// premature notifications). Bounded: a prompt that never started a run
-			// (extension command) retires via the watchdog within seconds, and the
-			// timeout is the last-resort guarantee against wedging this tool.
-			await Promise.race([
-				instance.runPromise?.catch(() => undefined),
-				new Promise((resolve) => setTimeout(resolve, 15_000)),
-			]);
+			// handler on the same event stream. Bounded: if the handler fails to
+			// retire in time (e.g. a compaction race kept it pending), the child is
+			// wedged — kill it outright; the run's exit listener then rejects and
+			// retires the handler for real, and the instance degrades to a
+			// resumable on-disk leftover.
+			let retireTimer: ReturnType<typeof setTimeout> | undefined;
+			try {
+				const retired = await Promise.race([
+					instance.runPromise?.catch(() => undefined).then(() => true),
+					new Promise<false>((resolve) => {
+						retireTimer = setTimeout(() => resolve(false), 15_000);
+					}),
+				]);
+				if (retired !== true && instance.client.alive) {
+					instance.client.kill();
+					await instance.runPromise?.catch(() => undefined);
+					instance.meta.status = "recovered";
+					instance.meta.lastError = "Aborted run wedged and the process was killed; resume it from disk via subagent({ instance, task }) or drop it.";
+					currentPool.saveMeta(instance);
+					return {
+						content: [{
+							type: "text" as const,
+							text: `Subagent "${instance.meta.id}" did not stop cleanly within 15s and its process was killed. ` +
+								`Its context is preserved on disk. Resume it with subagent({ instance: "${instance.meta.id}", task }) ` +
+								`or drop it with subagent_decide({ instance: "${instance.meta.id}", decision: "drop" }).`,
+						}],
+						details: { instanceId: instance.meta.id, aborted: true, killed: true },
+					};
+				}
+			} finally {
+				// A referenced timer would keep a short-lived print-mode process
+				// alive for the full 15s after the race already settled.
+				if (retireTimer) clearTimeout(retireTimer);
+			}
 			instance.meta.lastError = "Run aborted by the main agent; no result was produced.";
 			instance.meta.status = "awaiting_decision";
 			currentPool.saveMeta(instance);

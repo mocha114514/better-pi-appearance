@@ -64,11 +64,19 @@ class SubagentOverlay implements Component {
 		/** Content rows this instance may use: shrunk when the space above the
 		 * indicator is tight, so the panel never covers what it anchors to. */
 		private readonly viewportCap: number = MAX_VIEWPORT_ROWS,
+		/** Layout shifts can move the indicator under the panel; a click anywhere
+		 * on the panel is the always-available escape hatch (pi's mouse dispatcher
+		 * does not route clicks on overlay area to components underneath). */
+		private readonly onClose: () => void,
 	) {}
 
 	invalidate(): void {}
 
 	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+		if (event.type === "click" && event.button === "left") {
+			this.onClose();
+			return { handled: true };
+		}
 		if (event.type !== "wheel" || event.wheelDelta === undefined) return undefined;
 		const maxOffset = Math.max(0, this.pool.list().length - this.viewportCap);
 		// wheelDelta is in logical lines; negative scrolls up.
@@ -178,7 +186,7 @@ export function installSubagentWidget(ctx: ExtensionContext, pool: InstancePool)
 			const cap = Math.min(MAX_VIEWPORT_ROWS, anchorRow - 2);
 			if (cap >= 1) {
 				const height = Math.min(pool.list().length, cap) + 2;
-				overlayHandle = tui.showOverlay(new SubagentOverlay(tui, ctx, pool, cap), {
+				overlayHandle = tui.showOverlay(new SubagentOverlay(tui, ctx, pool, cap, closeOverlay), {
 					row: Math.max(0, anchorRow - height),
 					col: 1,
 					maxHeight: MAX_VIEWPORT_ROWS + 2,
@@ -188,7 +196,7 @@ export function installSubagentWidget(ctx: ExtensionContext, pool: InstancePool)
 			}
 		}
 		// No click coordinates or no room above: legacy anchor.
-		overlayHandle = tui.showOverlay(new SubagentOverlay(tui, ctx, pool), {
+		overlayHandle = tui.showOverlay(new SubagentOverlay(tui, ctx, pool, undefined, closeOverlay), {
 			anchor: "bottom-left",
 			margin: 1,
 			maxHeight: MAX_VIEWPORT_ROWS + 2,
@@ -221,9 +229,16 @@ export function installSubagentWidget(ctx: ExtensionContext, pool: InstancePool)
 		tui?.requestRender();
 	});
 
+	// Terminal resizes move the indicator row; the absolute anchor we captured
+	// at click time would then be stale (panel could cover the indicator).
+	// Close on resize — the next click reopens at a fresh coordinate.
+	const onResize = () => closeOverlay();
+	process.stdout.on("resize", onResize);
+
 	return {
 		dispose() {
 			unsubscribe();
+			process.stdout.off("resize", onResize);
 			closeOverlay();
 			ctx.ui.setWidget(WIDGET_KEY, undefined);
 			tui = undefined;
