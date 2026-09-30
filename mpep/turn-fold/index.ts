@@ -30,6 +30,7 @@ export default function (pi: ExtensionAPI): void {
 	const disposeNotifyCapture = installNotifyCapture();
 	// Note: Markdown rendering enhancements were extracted into the standalone
 	// "markdown-enhancer" plugin (see ../markdown-enhancer/).
+	// Speculative MCP compatibility bridge, currently without consumers (see the module header).
 	const disposeMcp = setupMcpCoordinator();
 	registerBuiltInTools(pi);
 	const restoreSession = (_event: unknown, ctx: ExtensionContext) => {

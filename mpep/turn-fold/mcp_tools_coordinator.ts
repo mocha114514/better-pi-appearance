@@ -1,3 +1,14 @@
+/**
+ * Compatibility bridge: fold-aware renderers exposed on `globalThis` for MCP extensions.
+ *
+ * Extensions cannot import from each other, so turn-fold publishes its compact tool
+ * renderers here; an MCP extension without its own renderers can adopt them by reading
+ * `globalThis.__minimalToolsCoordinator` and delegating its renderCall/renderResult.
+ *
+ * Status: speculative. No known consumer has ever existed — pi-mcp-adapter and pi's
+ * official MCP extension both ship their own renderers. Kept in case a future MCP
+ * extension wants the integration; safe to delete once that is clearly never needed.
+ */
 import type { ToolRenderResultOptions } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import type { ToolPresentationContext } from "./extension_types.ts";
