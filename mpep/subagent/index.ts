@@ -278,7 +278,8 @@ export default function (pi: ExtensionAPI): void {
 				currentPool.saveMeta(instance);
 				notify(
 					`Subagent "${instance.meta.id}" (agent: ${instance.meta.agent}) was interrupted: ${truncate(message, 200)} ` +
-						`Its context is preserved on disk. Call subagent_check({ instance: "${instance.meta.id}" }) for details, then resume or drop it.`,
+						`Its context is intact. Call subagent_check({ instance: "${instance.meta.id}" }) for details, ` +
+						`then resume it with a wrap-up inquiry to harvest partial work before deciding to drop.`,
 				);
 			}
 		})();
@@ -497,6 +498,7 @@ export default function (pi: ExtensionAPI): void {
 			"After reading a subagent result via subagent_check, immediately call subagent_decide (keep or drop) for that instance.",
 			"Pass the instance id to continue a kept subagent instead of starting a new one.",
 			"Dispatches are asynchronous: do not idle-wait after dispatching; the completion notification will arrive.",
+			"When a subagent is interrupted or ends without output (usually a provider failure), do NOT drop it immediately: resume it with a short wrap-up inquiry first — its accumulated work is usually still in context and harvestable.",
 			"Name new instances meaningfully (snake_case via the name parameter), e.g. name: frontend_auth_investigation.",
 		],
 		parameters: Type.Object({
@@ -753,8 +755,9 @@ export default function (pi: ExtensionAPI): void {
 						content: [{
 							type: "text" as const,
 							text: `Subagent "${instance.meta.id}" did not stop cleanly within 15s and its process was killed. ` +
-								`Its context is preserved on disk. Resume it with subagent({ instance: "${instance.meta.id}", task }) ` +
-								`or drop it with subagent_decide({ instance: "${instance.meta.id}", decision: "drop" }).`,
+								`Its context is preserved. Do NOT drop it right away: resume it first with a short wrap-up inquiry, e.g. ` +
+								`subagent({ instance: "${instance.meta.id}", task: "You were interrupted. Report what you accomplished so far, then submit your partial findings." }) ` +
+								`— interrupted work is usually still in context and harvestable. Only drop it (subagent_decide) if the resume also fails.`,
 						}],
 						details: { instanceId: instance.meta.id, aborted: true, killed: true },
 					};
@@ -826,8 +829,9 @@ export default function (pi: ExtensionAPI): void {
 						type: "text" as const,
 						text: `Subagent "${instance.meta.id}" was interrupted and has no result.\n` +
 							(instance.meta.lastError ? `Last error: ${instance.meta.lastError}\n` : "") +
-							`Its context is preserved on disk. Resume it with subagent({ instance: "${instance.meta.id}", task }) ` +
-							`or drop it with subagent_decide({ instance: "${instance.meta.id}", decision: "drop" }).`,
+							`Its context is preserved. Do NOT drop it right away: resume it first with a short wrap-up inquiry, e.g. ` +
+							`subagent({ instance: "${instance.meta.id}", task: "You were interrupted. Report what you accomplished so far, then submit your partial findings." }) ` +
+							`— interrupted work is usually still in context and harvestable. Only drop it (subagent_decide) if the resume also fails.`,
 					}],
 					details: {
 						instanceId: instance.meta.id,
