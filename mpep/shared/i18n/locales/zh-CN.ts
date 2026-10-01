@@ -158,7 +158,6 @@ export const zhCN = {
   "export.emptySession": "当前会话还没有可导出的内容",
   "timer.cooking": "Cooking",
   "timer.cooked": "cooked for {elapsed}",
-  "scroll.unsupported": "全屏滚动：当前 Pi 版本未提供 wheelScrollLines。",
   "navigator.unsupported": "轮次导航：当前全屏布局不受支持。",
   "tps.report": "TPS {tps} tok/s. 输出 {output}，输入 {input}，缓存读/写 {cacheRead}/{cacheWrite}，合计 {total}，cooked for {seconds}s",
   "turnNotify.title": "Pi",

@@ -20,7 +20,6 @@
       "./turn-navigator/index.ts",
       "./path-links/index.ts",
       "./cooking-timer.ts",
-      "./fullscreen-scroll.ts",
       "./statusline.ts",
       "./tps.ts",
       "./turn-notify/index.ts",

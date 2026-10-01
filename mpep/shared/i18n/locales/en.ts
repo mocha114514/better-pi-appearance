@@ -157,7 +157,6 @@ export const en = {
   "export.emptySession": "This session has nothing to export yet",
   "timer.cooking": "Cooking",
   "timer.cooked": "cooked for {elapsed}",
-  "scroll.unsupported": "Fullscreen scroll: this Pi version does not expose wheelScrollLines.",
   "navigator.unsupported": "Turn navigator: unsupported fullscreen layout.",
   "tps.report": "TPS {tps} tok/s. out {output}, in {input}, cache r/w {cacheRead}/{cacheWrite}, total {total}, cooked for {seconds}s",
   "turnNotify.title": "Pi",
