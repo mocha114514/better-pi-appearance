@@ -216,6 +216,25 @@ export default function (pi: ExtensionAPI): void {
 					// invalidated; the instance stays discoverable via subagent_list.
 				}
 			};
+			// Persist the mailbox and announce the delivery: result.md holds the
+			// deliverable, meta holds the unread mark, so a main-session restart
+			// never loses a result.
+			const deliver = (output: string) => {
+				instance.finalOutput = output;
+				instance.meta.status = "awaiting_decision";
+				instance.meta.unread = true;
+				instance.meta.lastError = undefined;
+				try {
+					fs.writeFileSync(path.join(instance.dir, "result.md"), output, "utf-8");
+				} catch {
+					// Best-effort; the in-memory copy still serves this session.
+				}
+				currentPool.saveMeta(instance);
+				notify(
+					`Subagent "${instance.meta.id}" (agent: ${instance.meta.agent}) has completed. ` +
+						`Call subagent_check({ instance: "${instance.meta.id}" }) to read its result, then keep or drop it.`,
+				);
+			};
 			try {
 				const outcome = await runPrompt(instance, task, undefined, undefined);
 				// Deliberate abort: consume the run silently. The abort tool already
@@ -250,28 +269,25 @@ export default function (pi: ExtensionAPI): void {
 					);
 					return;
 				}
-				// Persist the mailbox: result.md holds the deliverable, meta holds
-				// the unread mark, so a main-session restart never loses a result.
-				instance.finalOutput = output;
-				instance.meta.status = "awaiting_decision";
-				instance.meta.unread = true;
-				instance.meta.lastError = undefined;
-				try {
-					fs.writeFileSync(path.join(instance.dir, "result.md"), output, "utf-8");
-				} catch {
-					// Best-effort; the in-memory copy still serves this session.
-				}
-				currentPool.saveMeta(instance);
-				notify(
-					`Subagent "${instance.meta.id}" (agent: ${instance.meta.agent}) has completed. ` +
-						`Call subagent_check({ instance: "${instance.meta.id}" }) to read its result, then keep or drop it.`,
-				);
+				deliver(output);
 			} catch (error) {
 				if (instance.abortInitiated) {
 					instance.abortInitiated = false;
 					return;
 				}
 				if (!stillRegistered()) return;
+				// Salvage: pi 0.85.x makes one more model call AFTER a successful
+				// submit_result; a provider error on that extra turn rejects the run
+				// even though the deliverable is already validated on disk. The
+				// dispatch cleared output.json at task start, so any submission found
+				// now belongs to THIS run — deliver it instead of losing it.
+				if (expectsOutput) {
+					const submitted = readSubmittedOutput(instance);
+					if (submitted !== undefined) {
+						deliver(JSON.stringify(submitted, null, 2));
+						return;
+					}
+				}
 				const message = error instanceof Error ? error.message : String(error);
 				instance.meta.lastError = message;
 				instance.meta.unread = true;
@@ -413,6 +429,11 @@ export default function (pi: ExtensionAPI): void {
 							}
 							done = true;
 							cleanup();
+							// A wedged child must be reaped, not just abandoned: the resume
+							// guidance respawns only when the client is dead, and abort
+							// refuses non-running instances — killing here is what makes
+							// the leftover actually recoverable.
+							client.killSync();
 							reject(new Error("subagent stopped servicing RPC (wedged child)"));
 							return;
 						}
