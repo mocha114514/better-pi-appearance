@@ -33,6 +33,15 @@ const TOOL_NAME = "request_compaction";
 const ENTRY_TYPE = "compact-forewarn";
 const DEFAULT_MARGIN_TOKENS = 30_000;
 const DEFAULT_RESERVE_TOKENS = 16_384;
+/**
+ * Stale-reminder guard window. The forewarn reminder is steered into the
+ * conversation and PERSISTS there; Pi's compaction keeps the recent tail
+ * verbatim, so the resumed model still sees the old reminder and would call
+ * the tool again, compacting in a loop. For this long after any successful
+ * compaction, sub-threshold calls are rejected as almost certainly triggered
+ * by the stale reminder rather than by real need.
+ */
+const STALE_REJECT_WINDOW_MS = 10 * 60 * 1000;
 
 function getCompactionReserveTokens(cwd?: string): number {
 	const paths = [
@@ -64,6 +73,7 @@ function buildReminder(marginTokens: number): string {
 	return [
 		"<system-reminder>",
 		"This is an automated notice injected by the local environment (compact-forewarn extension), not a message from the user.",
+		"This notice stays in the conversation history. Once a compaction has completed, every earlier copy of this notice is obsolete; act only on the newest one and never compact twice for the same notice.",
 		`A context compaction will trigger soon (approximately ${marginTokens.toLocaleString("en-US")} tokens remaining).`,
 		"To keep a sudden compaction from splitting an atomic piece of work, please:",
 		`1. If you see this notice while at a clean task boundary (an old task has ended, a new one is starting) or a milestone, call \`${TOOL_NAME}\` immediately before proceeding.`,
@@ -88,6 +98,12 @@ export default function compactForewarn(pi: ExtensionAPI): void {
 	let compactionStarted = false;
 	let pendingInstructions: string | undefined;
 	let marginTokens = DEFAULT_MARGIN_TOKENS;
+	// Timestamp of the last successful compaction (ours, /compact, threshold, or
+	// overflow). Drives the stale-reminder rejection in the tool.
+	let lastCompactedAt = 0;
+
+	const thresholdFor = (contextWindow: number, cwd?: string): number =>
+		contextWindow - getCompactionReserveTokens(cwd) - marginTokens;
 
 	const resetCompactionRequest = () => {
 		pending = false;
@@ -108,12 +124,25 @@ export default function compactForewarn(pi: ExtensionAPI): void {
 				resetCompactionRequest();
 				pi.sendUserMessage(
 					"[System Notice: Context compaction has completed successfully. " +
-						"Please review your previous plan and resume your remaining work seamlessly.]",
+						"Any compaction forewarning (<system-reminder> about an approaching context limit) still visible " +
+						"in the kept history is now OBSOLETE — do not call request_compaction again unless the extension " +
+						"issues a brand-new forewarning. Please review your previous plan and resume your remaining work " +
+						"seamlessly.]",
 					{ deliverAs: "followUp" },
 				);
 			},
 			onError: () => {
 				resetCompactionRequest();
+				// The requesting run already terminated, so nothing would wake the
+				// agent up otherwise (in practice it used to linger until some
+				// unrelated notification happened to trigger a turn). Resume with a
+				// failure notice so work continues and a later retry stays possible.
+				pi.sendUserMessage(
+					"[System Notice: The requested context compaction failed or was aborted, so no compaction took " +
+						"place. Continue your work normally; you may call request_compaction again at the next clean " +
+						"boundary if the forewarning is still relevant.]",
+					{ deliverAs: "followUp" },
+				);
 			},
 		});
 	};
@@ -163,7 +192,7 @@ export default function compactForewarn(pi: ExtensionAPI): void {
 				}),
 			),
 		}),
-		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			if (pending) {
 				// Same-batch duplicates must also terminate. One non-terminating
 				// result keeps the whole batch alive and the run continues.
@@ -172,6 +201,37 @@ export default function compactForewarn(pi: ExtensionAPI): void {
 					details: {},
 					terminate: true,
 				};
+			}
+
+			// Stale-reminder guard. Without a fresh forewarn (armed === false), a
+			// call arriving soon after a completed compaction while usage is back
+			// below the forewarn threshold is the model obeying the OLD reminder
+			// still sitting in the kept tail. Reject it WITHOUT terminating so the
+			// run continues with real work, breaking the compact-resume-compact loop.
+			if (!armed && lastCompactedAt > 0 && Date.now() - lastCompactedAt < STALE_REJECT_WINDOW_MS) {
+				const usage = ctx.getContextUsage();
+				// Unavailable usage (undefined / tokens null right after a compaction)
+				// is treated as "cannot prove need" — inside the window that is exactly
+				// the stale-reminder scenario, so bias toward rejecting.
+				const belowThreshold =
+					usage === undefined ||
+					usage.tokens === null ||
+					usage.tokens <= thresholdFor(usage.contextWindow, ctx.cwd);
+				if (belowThreshold) {
+					return {
+						content: [{
+							type: "text",
+							text:
+								"Compaction was rejected: a compaction already completed less than " +
+								`${Math.round(STALE_REJECT_WINDOW_MS / 60000)} minutes ago and context usage is back below the ` +
+								"forewarn threshold. The forewarning you are acting on is a stale copy left in history; " +
+								"do NOT call this tool again until a brand-new forewarning arrives or substantial new work " +
+								"accumulates. Continue your actual task now.",
+						}],
+						details: { rejected: true, reason: "stale-reminder" },
+						terminate: false,
+					};
+				}
 			}
 			pending = true;
 
@@ -206,8 +266,7 @@ export default function compactForewarn(pi: ExtensionAPI): void {
 		const usage = ctx.getContextUsage();
 		// tokens is null right after a compaction, before the next LLM response.
 		if (!usage || usage.tokens === null) return;
-		const reserveTokens = getCompactionReserveTokens(ctx.cwd);
-		const threshold = usage.contextWindow - reserveTokens - marginTokens;
+		const threshold = thresholdFor(usage.contextWindow, ctx.cwd);
 		if (threshold <= 0) return;
 		if (usage.tokens <= threshold) return;
 
@@ -230,6 +289,7 @@ export default function compactForewarn(pi: ExtensionAPI): void {
 	// at any time, so the model can retry on its own).
 	pi.on("session_compact", () => {
 		armed = false;
+		lastCompactedAt = Date.now();
 		resetCompactionRequest();
 	});
 	pi.on("session_compact_failed", () => {
