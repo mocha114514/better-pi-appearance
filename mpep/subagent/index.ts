@@ -904,14 +904,20 @@ export default function (pi: ExtensionAPI): void {
 					details: { instanceId: instance.meta.id, aborted: true },
 				};
 			}
-			if (!retired) {
+			if (!retired || !instance.client.alive) {
+				// Either our 15s deadline force-reaped a wedged child, or the
+				// completion watchdog reaped it while our RPC abort was in flight
+				// (client.abort() swallows the rejection, so the handler retires
+				// "cleanly" — but there is no live process left to keep).
+				// recovered is never auto-swept: the resumable context survives even
+				// if the main run is Esc-interrupted right now.
 				instance.meta.status = "recovered";
-				instance.meta.lastError = "Aborted run wedged and the process was killed; resume it from disk via subagent({ instance, task }) or drop it.";
+				instance.meta.lastError = "Run was wedged and its process was killed; resume it from disk via subagent({ instance, task }) or drop it.";
 				currentPool.saveMeta(instance);
 				return {
 					content: [{
 						type: "text" as const,
-						text: `Subagent "${instance.meta.id}" did not stop cleanly within 15s and its process was killed. ` +
+						text: `Subagent "${instance.meta.id}" wedged and its process was killed. ` +
 							`Its context is preserved. Do NOT drop it right away: resume it first with a short wrap-up inquiry, e.g. ` +
 							`subagent({ instance: "${instance.meta.id}", task: "You were interrupted. Report what you accomplished so far, then submit your partial findings." }) ` +
 							`— interrupted work is usually still in context and harvestable. Only drop it (subagent_decide) if the resume also fails.`,
