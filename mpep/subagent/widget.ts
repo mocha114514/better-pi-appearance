@@ -118,7 +118,12 @@ class SubagentOverlay implements Component {
 		const slice = rows.slice(this.scrollOffset, this.scrollOffset + this.viewportCap);
 		for (const row of slice) {
 			const content = ` ${row.dot} ${row.id.padEnd(idW)}  ${row.model.padEnd(modelW)}  ${row.thinking.padEnd(thinkW)}  ${row.status}`;
-			lines.push(truncateToWidth(`${border("│")}${content}`, boxWidth - 1, "") + border("│"));
+			// Truncate first, then pad by *visible* width (content carries ANSI
+			// color codes, so String.length would overcount) — keeps the right
+			// border column-aligned across rows with different status lengths.
+			const truncated = truncateToWidth(content, boxWidth - 2, "");
+			const pad = Math.max(0, boxWidth - 2 - visibleWidth(truncated));
+			lines.push(border("│") + truncated + " ".repeat(pad) + border("│"));
 		}
 
 		const scrolled = items.length > this.viewportCap;
