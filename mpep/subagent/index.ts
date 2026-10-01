@@ -553,6 +553,9 @@ export default function (pi: ExtensionAPI): void {
 						const spawnPlan = buildSpawn(agentConfig, instance, context.cwd, context.thinkingLevel ?? "off", context.model ? `${context.model.provider}/${context.model.id}` : undefined);
 						instance.meta.model = spawnPlan.model;
 						instance.meta.thinking = spawnPlan.thinking;
+						// A respawn builds the child from the CURRENT definition, so the
+						// structured-output contract follows the new process.
+						instance.meta.hasStructuredOutput = agentConfig.output !== undefined;
 						client = new RpcSubprocess(context.cwd, spawnPlan.args, spawnPlan.env);
 					} catch (error) {
 						instance.meta.status = previousStatus;
@@ -570,6 +573,11 @@ export default function (pi: ExtensionAPI): void {
 						if (currentPool.get(instance.meta.id) === instance) {
 							instance.meta.status = previousStatus;
 							currentPool.saveMeta(instance);
+						} else {
+							// Dropped mid-handshake: drop() soft-killed the client, but a
+							// stalled startup may outlive the escalation timer — reap
+							// synchronously so no ghost process survives the throw.
+							client.killSync();
 						}
 						throw error;
 					} finally {
@@ -629,10 +637,14 @@ export default function (pi: ExtensionAPI): void {
 				} catch (error) {
 					// Startup failure: keep the directory so the failure is inspectable,
 					// mark it recovered, and surface the error. Skip the bookkeeping
-					// entirely if a parallel drop already removed the instance.
+					// entirely if a parallel drop already removed the instance — and
+					// reap the process synchronously (a stalled startup can outlive
+					// the soft-kill escalation timer).
 					if (currentPool.get(instance.meta.id) === instance) {
 						instance.meta.status = "recovered";
 						currentPool.saveMeta(instance);
+					} else {
+						client.killSync();
 					}
 					throw error;
 				} finally {
@@ -654,6 +666,10 @@ export default function (pi: ExtensionAPI): void {
 			instance.finalOutput = "";
 			instance.meta.lastError = undefined;
 			instance.meta.unread = false;
+			// A stale abort flag must never leak into a new run: an abort that hit
+			// a STARTUP (no run handler existed to consume it) would otherwise make
+			// this run's handler silently discard its own result.
+			instance.abortInitiated = false;
 			// Invalidate the persisted mailbox too: a restart between an abort and
 			// the next delivery must never hydrate the PREVIOUS task's result.md
 			// and present it as this task's deliverable.
