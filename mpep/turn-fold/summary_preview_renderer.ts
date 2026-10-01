@@ -1,7 +1,7 @@
 import { t } from "../shared/i18n/index.ts";
 import { homedir } from "node:os";
 import type { Theme, ThemeColor } from "@earendil-works/pi-coding-agent";
-import { truncateToWidth } from "@earendil-works/pi-tui";
+import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { ActivePreview, ToolRecord, TurnState } from "./extension_types.ts";
 
 export type DisplayTheme = Pick<Theme, "fg" | "bold" | "italic">;
@@ -82,7 +82,12 @@ export function getActivePreview(group: TurnState): ActivePreview | undefined {
 	}
 }
 
-export function renderSummary(group: TurnState, theme: DisplayTheme): string {
+interface SummaryContent {
+	icon: string;
+	parts: string[];
+}
+
+function buildSummaryContent(group: TurnState, theme: DisplayTheme): SummaryContent {
 	const stats = new Map<string, { successes: number; errors: number }>();
 	for (const tool of group.tools.values()) {
 		const name = toolLabel(tool.name);
@@ -116,5 +121,56 @@ export function renderSummary(group: TurnState, theme: DisplayTheme): string {
 		[...group.tools.values()].some((tool) => tool.isPartial) || (!group.sealed && lastWork?.type === "thinking");
 	const failed = [...group.tools.values()].some((tool) => tool.isError);
 	const icon = running ? theme.fg("warning", "⋯ ") : failed ? theme.fg("error", "! ") : theme.fg("success", "✓ ");
-	return icon + parts.join(theme.fg("muted", " • ")) + theme.fg("muted", t("activity.expandHint"));
+	return { icon, parts };
+}
+
+export function renderSummary(group: TurnState, theme: DisplayTheme): string {
+	const summary = buildSummaryContent(group, theme);
+	return summary.icon + summary.parts.join(theme.fg("muted", " • ")) + theme.fg("muted", t("activity.expandHint"));
+}
+
+/**
+ * Wrap at whole summary-item boundaries so a tool name and its counts never split.
+ * Continuation lines align with the first character after the status icon.
+ */
+export function renderSummaryLines(group: TurnState, theme: DisplayTheme, width: number): string[] {
+	const maxWidth = Math.max(1, width);
+	const summary = buildSummaryContent(group, theme);
+	const iconWidth = visibleWidth(summary.icon);
+	const continuationIndent = " ".repeat(Math.min(iconWidth, Math.max(0, maxWidth - 1)));
+	const lines: string[] = [];
+	let line = truncateToWidth(summary.icon, maxWidth, "");
+	let lineWidth = visibleWidth(line);
+	let hasContent = false;
+
+	const startNewLine = () => {
+		lines.push(line);
+		line = continuationIndent;
+		lineWidth = visibleWidth(line);
+		hasContent = false;
+	};
+	const appendSegment = (inlineSegment: string, lineStartSegment: string, separator = "") => {
+		if (!hasContent) {
+			const availableWidth = Math.max(1, maxWidth - lineWidth);
+			const fitted = truncateToWidth(lineStartSegment, availableWidth, "...");
+			line += fitted;
+			lineWidth += visibleWidth(fitted);
+			hasContent = true;
+			return;
+		}
+		const candidate = separator + inlineSegment;
+		if (lineWidth + visibleWidth(candidate) > maxWidth) {
+			startNewLine();
+			appendSegment(lineStartSegment, lineStartSegment);
+			return;
+		}
+		line += candidate;
+		lineWidth += visibleWidth(candidate);
+	};
+
+	for (const part of summary.parts) appendSegment(part, part, theme.fg("muted", " • "));
+	const hintText = t("activity.expandHint");
+	appendSegment(theme.fg("muted", hintText), theme.fg("muted", hintText.trimStart()));
+	lines.push(line);
+	return lines;
 }

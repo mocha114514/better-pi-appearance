@@ -24,7 +24,7 @@ import {
 	formatPreview,
 	getActivePreview,
 	getLatestTheme,
-	renderSummary,
+	renderSummaryLines,
 	safeThemeFg,
 	toolHeader,
 } from "./summary_preview_renderer.ts";
@@ -68,7 +68,7 @@ class ActivityGroupComponent extends Container {
 		const group = turnStates.get(this.groupId);
 		if (!group) return [];
 		const theme = getLatestTheme();
-		this.addChild(createSummaryMouseRegion(new FixedLines([renderSummary(group, theme)]), group.id));
+		this.addChild(createSummaryMouseRegion(new FixedLines(renderSummaryLines(group, theme, width)), group.id));
 		if (!group.expanded) {
 			const preview = getActivePreview(group);
 			if (preview) this.addChild(new FixedLines(formatPreview(preview, theme, width)));
