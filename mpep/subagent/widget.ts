@@ -84,7 +84,7 @@ class SubagentOverlay implements Component {
 		return { handled: true };
 	}
 
-	render(_width: number): string[] {
+	render(width: number): string[] {
 		const theme = this.ctx.ui.theme;
 		const items = this.pool.list();
 		if (items.length === 0) return [];
@@ -99,14 +99,15 @@ class SubagentOverlay implements Component {
 			return { dot, id, model, thinking, status };
 		});
 
-		// Column widths from content, clamped to the terminal.
-		const termCols = this.tui.terminal.columns || 100;
+		// Column widths from content, clamped to the ALLOCATED width (pi caps
+		// overlay width — 0.85.x defaults to at most 80 columns — and forcibly
+		// truncates any line beyond it, which would eat the right border).
 		const plain = (s: string) => visibleWidth(s);
 		const idW = Math.max(...rows.map((r) => plain(r.id)));
 		const modelW = Math.max(...rows.map((r) => plain(r.model)));
 		const thinkW = Math.max(...rows.map((r) => plain(r.thinking)));
 		const natural = idW + modelW + thinkW + 8 + 12;
-		const boxWidth = Math.max(36, Math.min(natural, termCols - 6));
+		const boxWidth = Math.max(36, Math.min(natural, width - 2));
 
 		const border = (s: string) => theme.fg("dim", s);
 		const lines: string[] = [];
@@ -170,6 +171,10 @@ export function installSubagentWidget(ctx: ExtensionContext, pool: InstancePool)
 	let overlayHandle: OverlayHandle | undefined;
 	let overlayAnchorRow: number | undefined;
 
+	// Request a generous allocation so wide terminals actually get a wide
+	// panel; the component renders within whatever width it is given.
+	const overlayWidth = () => Math.max(40, Math.min((tui?.terminal.columns || 100) - 4, 120));
+
 	const closeOverlay = () => {
 		overlayHandle?.hide();
 		overlayHandle = undefined;
@@ -189,6 +194,7 @@ export function installSubagentWidget(ctx: ExtensionContext, pool: InstancePool)
 				overlayHandle = tui.showOverlay(new SubagentOverlay(tui, ctx, pool, cap, closeOverlay), {
 					row: Math.max(0, anchorRow - height),
 					col: 1,
+					width: overlayWidth(),
 					maxHeight: MAX_VIEWPORT_ROWS + 2,
 					nonCapturing: true,
 				});
@@ -199,6 +205,7 @@ export function installSubagentWidget(ctx: ExtensionContext, pool: InstancePool)
 		overlayHandle = tui.showOverlay(new SubagentOverlay(tui, ctx, pool, undefined, closeOverlay), {
 			anchor: "bottom-left",
 			margin: 1,
+			width: overlayWidth(),
 			maxHeight: MAX_VIEWPORT_ROWS + 2,
 			nonCapturing: true,
 		});

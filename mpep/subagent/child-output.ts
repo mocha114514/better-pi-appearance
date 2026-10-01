@@ -53,21 +53,17 @@ export default function (pi: ExtensionAPI): void {
 					.slice(0, 5)
 					.map((e) => `${e.instancePath || "/"}: ${e.message}`)
 					.join("; ");
-				return {
-					content: [{ type: "text" as const, text: `submit_result validation failed: ${problems}. Fix the fields and call submit_result again.` }],
-					details: {},
-					isError: true,
-				};
+				// Throw, don't return isError: pi 0.85.x does not consume a result's
+				// isError field — a returned failure would be recorded as a
+				// SUCCESSFUL submit_result and the model would stop. A thrown error
+				// reaches the real error channel so the model fixes and resubmits.
+				throw new Error(`submit_result validation failed: ${problems}. Fix the fields and call submit_result again.`);
 			}
 			try {
 				fs.mkdirSync(path.dirname(outputPath), { recursive: true });
 				fs.writeFileSync(outputPath, `${JSON.stringify(params, null, 2)}\n`, "utf-8");
 			} catch (error) {
-				return {
-					content: [{ type: "text" as const, text: `Failed to record the result: ${error instanceof Error ? error.message : String(error)}` }],
-					details: {},
-					isError: true,
-				};
+				throw new Error(`Failed to record the result: ${error instanceof Error ? error.message : String(error)}. Call submit_result again.`);
 			}
 			return {
 				content: [{ type: "text" as const, text: "Result submitted. The task is complete; stop now." }],

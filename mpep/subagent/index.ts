@@ -166,12 +166,12 @@ export default function (pi: ExtensionAPI): void {
 	 */
 	async function finalizeStructuredOutput(
 		instance: Instance,
-		agentConfig: AgentConfig | undefined,
+		expectsOutput: boolean,
 		outcome: RunOutcome,
 		signal?: AbortSignal,
 	): Promise<string> {
 		let output = outcome.finalOutput;
-		if (!agentConfig?.output) return output;
+		if (!expectsOutput) return output;
 		let submitted = readSubmittedOutput(instance);
 		if (submitted === undefined && !signal?.aborted) {
 			// The child ended without submit_result: one explicit reminder
@@ -198,7 +198,7 @@ export default function (pi: ExtensionAPI): void {
 	 * it lands at the next tool boundary mid-run, or wakes the main agent when
 	 * idle. Results are never pushed in full — the main agent pulls them.
 	 */
-	function runInBackground(instance: Instance, agentConfig: AgentConfig | undefined, task: string, currentPool: InstancePool): void {
+	function runInBackground(instance: Instance, expectsOutput: boolean, task: string, currentPool: InstancePool): void {
 		instance.runPromise = (async () => {
 			// True while this instance is registered; drop() removes it and
 			// shutdown clears the whole registry, so any async continuation must
@@ -226,7 +226,7 @@ export default function (pi: ExtensionAPI): void {
 					return;
 				}
 				if (!stillRegistered()) return;
-				const output = await finalizeStructuredOutput(instance, agentConfig, outcome);
+				const output = await finalizeStructuredOutput(instance, expectsOutput, outcome);
 				if (instance.abortInitiated) {
 					instance.abortInitiated = false;
 					return;
@@ -373,13 +373,17 @@ export default function (pi: ExtensionAPI): void {
 			const confirmIdle = () => {
 				// Single polling chain per run: prompt-accept AND every agent_settled
 				// may arm this, and concurrent chains would share (and burn) the
-				// probe budget N times faster.
+				// probe budget N times faster. The guard is held across the in-flight
+				// probe too — a settle arriving mid-request must not arm a parallel
+				// timer. It is released only when deliberately re-arming or retiring.
 				if (done || pollActive) return;
 				pollActive = true;
 				settleTimer = setTimeout(() => {
-					pollActive = false;
 					void (async () => {
-						if (done) return;
+						if (done) {
+							pollActive = false;
+							return;
+						}
 						try {
 							const state = await client.getState();
 							const busy = state.isStreaming || state.isCompacting || (state.pendingMessageCount ?? 0) > 0;
@@ -387,10 +391,12 @@ export default function (pi: ExtensionAPI): void {
 							probes += 1;
 							const delivered = (sawAgentEnd && idleStreak >= 2) || (!sawRunStart && idleStreak >= 20);
 							if (!delivered && probes < 1200) {
+								pollActive = false;
 								confirmIdle();
 								return;
 							}
 						} catch {
+							pollActive = false;
 							return; // process gone: offExit handles the rejection
 						}
 						finish();
@@ -554,16 +560,25 @@ export default function (pi: ExtensionAPI): void {
 					}
 					const onStartAbort = () => client.kill();
 					signal?.addEventListener("abort", onStartAbort, { once: true });
+					// Attach BEFORE the async startup: a parallel decide(drop) during
+					// the handshake kills via instance.client — without this it would
+					// find nothing to kill and leave a ghost process behind.
+					instance.client = client;
 					try {
 						await client.start();
 					} catch (error) {
-						instance.meta.status = previousStatus;
-						currentPool.saveMeta(instance);
+						if (currentPool.get(instance.meta.id) === instance) {
+							instance.meta.status = previousStatus;
+							currentPool.saveMeta(instance);
+						}
 						throw error;
 					} finally {
 						signal?.removeEventListener("abort", onStartAbort);
 					}
-					instance.client = client;
+					if (currentPool.get(instance.meta.id) !== instance) {
+						client.killSync();
+						throw new Error(`Subagent instance "${instance.meta.id}" was dropped while its process was starting up.`);
+					}
 				}
 				instance.meta.task = task;
 			} else {
@@ -587,6 +602,10 @@ export default function (pi: ExtensionAPI): void {
 						createdAt: Date.now(),
 						updatedAt: Date.now(),
 						status: "running",
+						// The structured-output contract survives definition edits: a warm
+						// continuation of a kept process still faces the ORIGINAL child's
+						// submit_result tool, even if the .md changed meanwhile.
+						hasStructuredOutput: agent.output !== undefined,
 					},
 					dir,
 					displayItems: [],
@@ -600,20 +619,29 @@ export default function (pi: ExtensionAPI): void {
 				instance.meta.model = spawnPlan.model;
 				instance.meta.thinking = spawnPlan.thinking;
 				const client = new RpcSubprocess(context.cwd, spawnPlan.args, spawnPlan.env);
+				// Attach BEFORE the async startup (same ghost-process reasoning as the
+				// respawn branch above).
+				instance.client = client;
 				const onStartAbort = () => client.kill();
 				signal?.addEventListener("abort", onStartAbort, { once: true });
 				try {
 					await client.start();
 				} catch (error) {
 					// Startup failure: keep the directory so the failure is inspectable,
-					// mark it recovered, and surface the error.
-					instance.meta.status = "recovered";
-					currentPool.saveMeta(instance);
+					// mark it recovered, and surface the error. Skip the bookkeeping
+					// entirely if a parallel drop already removed the instance.
+					if (currentPool.get(instance.meta.id) === instance) {
+						instance.meta.status = "recovered";
+						currentPool.saveMeta(instance);
+					}
 					throw error;
 				} finally {
 					signal?.removeEventListener("abort", onStartAbort);
 				}
-				instance.client = client;
+				if (currentPool.get(instance.meta.id) !== instance) {
+					client.killSync();
+					throw new Error(`Subagent instance "${instance.meta.id}" was dropped while its process was starting up.`);
+				}
 			}
 
 			instance.meta.status = "running";
@@ -636,13 +664,19 @@ export default function (pi: ExtensionAPI): void {
 			}
 			currentPool.saveMeta(instance);
 
+			// The structured-output contract comes from the DEFINITION on a cold
+			// spawn, but from the SPAWN-TIME record on a warm continuation: the
+			// resident child still has its original submit_result even if the .md
+			// was edited or deleted meanwhile.
+			const expectsOutput = agentConfig?.output !== undefined || instance.meta.hasStructuredOutput === true;
+
 			// A kept instance may hold a previous run's submission; clear it so a
 			// stale file is never mistaken for this run's deliverable.
-			if (agentConfig?.output) {
+			if (expectsOutput) {
 				fs.rmSync(path.join(instance.dir, "output.json"), { force: true });
 			}
 
-			runInBackground(instance, agentConfig, task, currentPool);
+			runInBackground(instance, expectsOutput, task, currentPool);
 			return {
 				content: [{
 					type: "text" as const,
@@ -728,44 +762,58 @@ export default function (pi: ExtensionAPI): void {
 			// Set the flag BEFORE aborting: the background completion handler may
 			// fire as soon as the child's run ends, and it must skip the wake-up.
 			instance.abortInitiated = true;
-			await instance.client.abort();
-			// Retire the old run handler before returning: RPC abort resolves when
-			// the session is idle, but our own idle polling may still be in flight.
-			// Without this wait, an immediate continuation would stack a second run
-			// handler on the same event stream. Bounded: if the handler fails to
-			// retire in time (e.g. a compaction race kept it pending), the child is
-			// wedged — kill it outright; the run's exit listener then rejects and
-			// retires the handler for real, and the instance degrades to a
-			// resumable on-disk leftover.
+			// ONE deadline covers BOTH phases: the RPC abort itself can pend forever
+			// (a child stuck in an abort-insensitive tool, or not answering RPC at
+			// all — our send() has no timeout), and the run handler's retirement
+			// (our own idle polling) may lag behind it. If either phase wedges, the
+			// child is declared stuck: force-reap it SYNCHRONOUSLY (killSync — a
+			// soft kill's grace window would let a respawn overlap the old process
+			// on the same session directory), then degrade to a resumable leftover.
 			let retireTimer: ReturnType<typeof setTimeout> | undefined;
+			let retired = false;
 			try {
-				const retired = await Promise.race([
-					instance.runPromise?.catch(() => undefined).then(() => true),
+				retired = await Promise.race([
+					(async () => {
+						await instance.client!.abort();
+						await instance.runPromise?.catch(() => undefined);
+						return true;
+					})(),
 					new Promise<false>((resolve) => {
 						retireTimer = setTimeout(() => resolve(false), 15_000);
 					}),
 				]);
-				if (retired !== true && instance.client.alive) {
-					instance.client.kill();
-					await instance.runPromise?.catch(() => undefined);
-					instance.meta.status = "recovered";
-					instance.meta.lastError = "Aborted run wedged and the process was killed; resume it from disk via subagent({ instance, task }) or drop it.";
-					currentPool.saveMeta(instance);
-					return {
-						content: [{
-							type: "text" as const,
-							text: `Subagent "${instance.meta.id}" did not stop cleanly within 15s and its process was killed. ` +
-								`Its context is preserved. Do NOT drop it right away: resume it first with a short wrap-up inquiry, e.g. ` +
-								`subagent({ instance: "${instance.meta.id}", task: "You were interrupted. Report what you accomplished so far, then submit your partial findings." }) ` +
-								`— interrupted work is usually still in context and harvestable. Only drop it (subagent_decide) if the resume also fails.`,
-						}],
-						details: { instanceId: instance.meta.id, aborted: true, killed: true },
-					};
-				}
 			} finally {
 				// A referenced timer would keep a short-lived print-mode process
 				// alive for the full 15s after the race already settled.
 				if (retireTimer) clearTimeout(retireTimer);
+			}
+			if (!retired && instance.client.alive) {
+				instance.client.killSync();
+				await instance.runPromise?.catch(() => undefined);
+			}
+			// A parallel decide(drop) may have deleted the instance while we
+			// awaited: never persist or report state for an unregistered instance
+			// (saveMeta would resurrect the deleted directory).
+			if (currentPool.get(instance.meta.id) !== instance) {
+				return {
+					content: [{ type: "text" as const, text: `Subagent "${instance.meta.id}" was dropped while the abort was in flight; nothing left to update.` }],
+					details: { instanceId: instance.meta.id, aborted: true },
+				};
+			}
+			if (!retired) {
+				instance.meta.status = "recovered";
+				instance.meta.lastError = "Aborted run wedged and the process was killed; resume it from disk via subagent({ instance, task }) or drop it.";
+				currentPool.saveMeta(instance);
+				return {
+					content: [{
+						type: "text" as const,
+						text: `Subagent "${instance.meta.id}" did not stop cleanly within 15s and its process was killed. ` +
+							`Its context is preserved. Do NOT drop it right away: resume it first with a short wrap-up inquiry, e.g. ` +
+							`subagent({ instance: "${instance.meta.id}", task: "You were interrupted. Report what you accomplished so far, then submit your partial findings." }) ` +
+							`— interrupted work is usually still in context and harvestable. Only drop it (subagent_decide) if the resume also fails.`,
+					}],
+					details: { instanceId: instance.meta.id, aborted: true, killed: true },
+				};
 			}
 			instance.meta.lastError = "Run aborted by the main agent; no result was produced.";
 			instance.meta.status = "awaiting_decision";

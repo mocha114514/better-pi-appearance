@@ -41,6 +41,9 @@ export interface InstanceMeta {
 	unread?: boolean;
 	/** Persisted interruption detail, shown by subagent_check on recovery. */
 	lastError?: string;
+	/** Spawn-time structured-output contract: warm continuations must honor it
+	 * even if the agent definition was edited or deleted meanwhile. */
+	hasStructuredOutput?: boolean;
 }
 
 export interface Instance {
