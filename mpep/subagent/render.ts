@@ -117,6 +117,28 @@ export function extractFinalText(messages: unknown): string {
 	return "";
 }
 
+/**
+ * The terminal assistant message's error, if the run ended on stopReason
+ * "error". 0.85.x reports provider failures through agent_end (not by
+ * rejecting the RPC prompt), and extractFinalText happily walks BACKWARD past
+ * the empty error message to earlier prose — so without this check, a failed
+ * tail turn would be delivered as a successful partial result.
+ */
+export function terminalStopError(messages: unknown): string | undefined {
+	if (!Array.isArray(messages)) return undefined;
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const message = messages[i] as Record<string, unknown> | undefined;
+		if (!message || message.role !== "assistant") continue;
+		if (message.stopReason === "error") {
+			return typeof message.errorMessage === "string" && message.errorMessage.trim()
+				? message.errorMessage
+				: "provider error (the final turn ended with stopReason 'error')";
+		}
+		return undefined; // The LAST assistant message decides; earlier errors were retried.
+	}
+	return undefined;
+}
+
 interface Theme {
 	fg(color: ThemeColor, text: string): string;
 	bold(text: string): string;

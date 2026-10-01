@@ -39,6 +39,7 @@ import {
 	formatUsageStats,
 	renderSubagentCall,
 	renderSubagentResult,
+	terminalStopError,
 	truncate,
 } from "./render.ts";
 
@@ -308,6 +309,7 @@ export default function (pi: ExtensionAPI): void {
 			let sawRunStart = false;
 			let sawAgentEnd = false;
 			let idleStreak = 0;
+			let failStreak = 0;
 			let probes = 0;
 			const pushToolItem = (text: string) => {
 				currentTextItem = "";
@@ -386,6 +388,7 @@ export default function (pi: ExtensionAPI): void {
 						}
 						try {
 							const state = await client.getState();
+							failStreak = 0;
 							const busy = state.isStreaming || state.isCompacting || (state.pendingMessageCount ?? 0) > 0;
 							idleStreak = busy ? 0 : idleStreak + 1;
 							probes += 1;
@@ -396,8 +399,22 @@ export default function (pi: ExtensionAPI): void {
 								return;
 							}
 						} catch {
+							// Probe failed. Process gone -> offExit rejects. But a LIVE
+						// child that stops servicing RPC (stalled event loop) must not
+							// hang this handler forever: three consecutive failures with a
+							// live process = wedged, retire as an interruption.
 							pollActive = false;
-							return; // process gone: offExit handles the rejection
+							if (!client.alive) return;
+							failStreak += 1;
+							probes += 1;
+							if (failStreak < 3 && probes < 1200) {
+								confirmIdle();
+								return;
+							}
+							done = true;
+							cleanup();
+							reject(new Error("subagent stopped servicing RPC (wedged child)"));
+							return;
 						}
 						finish();
 					})();
@@ -407,6 +424,15 @@ export default function (pi: ExtensionAPI): void {
 				if (done) return;
 				done = true;
 				cleanup();
+				// 0.85.x reports provider failures through agent_end rather than
+				// rejecting the RPC prompt, and extractFinalText walks BACKWARD past
+				// the empty error turn to earlier prose — without this check a failed
+				// tail turn would be delivered as a successful partial result.
+				const stopError = terminalStopError(lastMessages);
+				if (stopError) {
+					reject(new Error(`subagent run ended on a provider error: ${stopError}`));
+					return;
+				}
 				resolve({ finalOutput: extractFinalText(lastMessages), messages: lastMessages });
 			};
 
@@ -536,6 +562,11 @@ export default function (pi: ExtensionAPI): void {
 				if (instance.meta.status === "running") {
 					throw new Error(`Subagent instance "${instance.meta.id}" is still running its previous task.`);
 				}
+				// Reset BEFORE any await: an abort arriving during this dispatch's
+				// startup must set the flag AFTER this point so the post-startup
+				// check can see it. By now any previous run's flag was consumed by
+				// its handler (the abort tool awaits handler retirement).
+				instance.abortInitiated = false;
 				agentConfig = discoverAgents().find((a) => a.name === instance!.meta.agent);
 				if (!instance.client || !instance.client.alive) {
 					if (!agentConfig) throw new Error(`Agent definition "${instance.meta.agent}" no longer exists; cannot respawn.`);
@@ -587,6 +618,18 @@ export default function (pi: ExtensionAPI): void {
 						client.killSync();
 						throw new Error(`Subagent instance "${instance.meta.id}" was dropped while its process was starting up.`);
 					}
+					if (instance.abortInitiated) {
+						// Aborted DURING startup: the RPC abort reached an idle child and
+						// cancelled nothing, so the task must never be sent. The process
+						// holds no useful context yet — kill it and degrade to a
+						// resumable leftover.
+						client.killSync();
+						instance.abortInitiated = false;
+						instance.meta.status = "recovered";
+						instance.meta.lastError = "Aborted during startup, before the task was sent.";
+						currentPool.saveMeta(instance);
+						throw new Error(`Subagent instance "${instance.meta.id}" was aborted during startup; the task was never sent.`);
+					}
 				}
 				instance.meta.task = task;
 			} else {
@@ -623,10 +666,20 @@ export default function (pi: ExtensionAPI): void {
 				currentPool.add(instance);
 				currentPool.saveMeta(instance);
 				agentConfig = agent;
-				const spawnPlan = buildSpawn(agent, instance, context.cwd, context.thinkingLevel ?? "off", context.model ? `${context.model.provider}/${context.model.id}` : undefined);
-				instance.meta.model = spawnPlan.model;
-				instance.meta.thinking = spawnPlan.thinking;
-				const client = new RpcSubprocess(context.cwd, spawnPlan.args, spawnPlan.env);
+				let client: RpcSubprocess;
+				try {
+					// buildSpawn writes prompt.md: a synchronous failure here (ENOSPC
+					// etc.) must not leave the registered instance wedged in "running"
+					// with no process behind it — mirror the respawn branch's rollback.
+					const spawnPlan = buildSpawn(agent, instance, context.cwd, context.thinkingLevel ?? "off", context.model ? `${context.model.provider}/${context.model.id}` : undefined);
+					instance.meta.model = spawnPlan.model;
+					instance.meta.thinking = spawnPlan.thinking;
+					client = new RpcSubprocess(context.cwd, spawnPlan.args, spawnPlan.env);
+				} catch (error) {
+					instance.meta.status = "recovered";
+					currentPool.saveMeta(instance);
+					throw error;
+				}
 				// Attach BEFORE the async startup (same ghost-process reasoning as the
 				// respawn branch above).
 				instance.client = client;
@@ -654,6 +707,16 @@ export default function (pi: ExtensionAPI): void {
 					client.killSync();
 					throw new Error(`Subagent instance "${instance.meta.id}" was dropped while its process was starting up.`);
 				}
+				if (instance.abortInitiated) {
+					// Aborted DURING startup (see the respawn branch above): the task
+					// must never be sent.
+					client.killSync();
+					instance.abortInitiated = false;
+					instance.meta.status = "recovered";
+					instance.meta.lastError = "Aborted during startup, before the task was sent.";
+					currentPool.saveMeta(instance);
+					throw new Error(`Subagent instance "${instance.meta.id}" was aborted during startup; the task was never sent.`);
+				}
 			}
 
 			instance.meta.status = "running";
@@ -666,10 +729,6 @@ export default function (pi: ExtensionAPI): void {
 			instance.finalOutput = "";
 			instance.meta.lastError = undefined;
 			instance.meta.unread = false;
-			// A stale abort flag must never leak into a new run: an abort that hit
-			// a STARTUP (no run handler existed to consume it) would otherwise make
-			// this run's handler silently discard its own result.
-			instance.abortInitiated = false;
 			// Invalidate the persisted mailbox too: a restart between an abort and
 			// the next delivery must never hydrate the PREVIOUS task's result.md
 			// and present it as this task's deliverable.
@@ -680,11 +739,11 @@ export default function (pi: ExtensionAPI): void {
 			}
 			currentPool.saveMeta(instance);
 
-			// The structured-output contract comes from the DEFINITION on a cold
-			// spawn, but from the SPAWN-TIME record on a warm continuation: the
-			// resident child still has its original submit_result even if the .md
-			// was edited or deleted meanwhile.
-			const expectsOutput = agentConfig?.output !== undefined || instance.meta.hasStructuredOutput === true;
+			// The structured-output contract ALWAYS follows the process's actual
+			// spawn: set at cold dispatch and refreshed at every respawn. A warm
+			// continuation must NOT consult the current definition — the resident
+			// child's toolset was fixed when ITS process started.
+			const expectsOutput = instance.meta.hasStructuredOutput === true;
 
 			// A kept instance may hold a previous run's submission; clear it so a
 			// stale file is never mistaken for this run's deliverable.
@@ -738,6 +797,14 @@ export default function (pi: ExtensionAPI): void {
 					content: [{ type: "text" as const, text: `Subagent instance "${instance.meta.id}" dropped and its files deleted.` }],
 					details: { instanceId: instance.meta.id, decision: "drop" },
 				};
+			}
+
+			// Keeping a RUNNING instance would release the dispatch reservation
+			// while its run is still active; the next continuation would then stack
+			// a second run handler on the same event stream. (Drop stays legal —
+			// it is the force-stop for a runaway.)
+			if (instance.meta.status === "running") {
+				throw new Error(`Subagent instance "${instance.meta.id}" is still running; wait for its completion notification or abort it first.`);
 			}
 
 			instance.meta.status = "kept";

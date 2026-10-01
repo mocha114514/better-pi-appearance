@@ -269,9 +269,10 @@ export class RpcSubprocess {
 	/** Live session state (isStreaming/isCompacting/pendingMessageCount).
 	 * Used after agent_settled to confirm the child is TRULY idle: 0.85.x runs
 	 * auto-compaction asynchronously after settle, and a compaction-resumed run
-	 * would otherwise look like fresh output arriving after delivery. */
+	 * would otherwise look like fresh output arriving after delivery.
+	 * Bounded: a child whose event loop is stalled must not hang the probe. */
 	async getState(): Promise<{ isStreaming?: boolean; isCompacting?: boolean; pendingMessageCount?: number }> {
-		const state = (await this.send({ type: "get_state" })) as Record<string, unknown>;
+		const state = (await this.sendWithTimeout({ type: "get_state" }, 5_000)) as Record<string, unknown>;
 		return state;
 	}
 
