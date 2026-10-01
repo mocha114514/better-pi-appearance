@@ -1071,6 +1071,23 @@ export default function (pi: ExtensionAPI): void {
 			compactionHeldNotices.push(content);
 			return;
 		}
+		// A compaction request is queued and waiting for the session to go idle
+		// (flag published by the compact-forewarn plugin). triggerTurn would start
+		// a fresh run and postpone that idle state indefinitely, starving the
+		// queued compaction. Deliver silently instead: the notice still enters
+		// the context (and thus the upcoming compaction summary) without
+		// starting a run.
+		if ((globalThis as unknown as Record<symbol, unknown>)[Symbol.for("mpep.compact-forewarn.pending")]) {
+			try {
+				pi.sendMessage(
+					{ customType: "mpep-subagent-notice", display: false, content },
+					{ triggerTurn: false },
+				);
+			} catch {
+				// Same invalidation caveat as sendNotice.
+			}
+			return;
+		}
 		sendNotice(content);
 	};
 

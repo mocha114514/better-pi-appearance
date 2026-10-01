@@ -34,6 +34,17 @@ const ENTRY_TYPE = "compact-forewarn";
 const DEFAULT_MARGIN_TOKENS = 30_000;
 const DEFAULT_RESERVE_TOKENS = 16_384;
 
+/**
+ * Cross-plugin slot: while a compaction request is queued and waiting for the
+ * session to go idle, this flag is true. The subagent plugin reads it to
+ * switch its completion notices to silent delivery (no triggerTurn), so a
+ * doorbell cannot keep postponing the settle the queued compaction waits for.
+ * (Plugins cannot import each other; a globalThis symbol is the established
+ * channel in this suite.)
+ */
+export const PENDING_SLOT = Symbol.for("mpep.compact-forewarn.pending");
+const sharedState = globalThis as unknown as Record<symbol, boolean | undefined>;
+
 function getCompactionReserveTokens(cwd?: string): number {
 	const paths = [
 		join(getAgentDir(), "settings.json"),
@@ -97,6 +108,7 @@ export default function compactForewarn(pi: ExtensionAPI): void {
 		pending = false;
 		compactionStarted = false;
 		pendingInstructions = undefined;
+		sharedState[PENDING_SLOT] = false;
 	};
 
 	// Idle-only. agent_settled is emitted after the run flag is cleared, so
@@ -106,33 +118,39 @@ export default function compactForewarn(pi: ExtensionAPI): void {
 		compactionStarted = true;
 		const customInstructions = pendingInstructions;
 		pendingInstructions = undefined;
-		ctx.compact({
-			customInstructions,
-			onComplete: () => {
-				resetCompactionRequest();
-				pi.sendUserMessage(
-					`[System Notice: Context compaction has completed successfully at ${new Date().toISOString()}. ` +
-						"Any compaction forewarning (<system-reminder> about an approaching context limit) with an " +
-						"earlier timestamp still visible in the kept history is now OBSOLETE — do not call " +
-						"request_compaction again unless the extension issues a brand-new forewarning. Please review " +
-						"your previous plan and resume your remaining work seamlessly.]",
-					{ deliverAs: "followUp" },
-				);
-			},
-			onError: () => {
-				resetCompactionRequest();
-				// The requesting run already terminated, so nothing would wake the
-				// agent up otherwise (in practice it used to linger until some
-				// unrelated notification happened to trigger a turn). Resume with a
-				// failure notice so work continues and a later retry stays possible.
-				pi.sendUserMessage(
-					"[System Notice: The requested context compaction failed or was aborted, so no compaction took " +
-						"place. Continue your work normally; you may call request_compaction again at the next clean " +
-						"boundary if the forewarning is still relevant.]",
-					{ deliverAs: "followUp" },
-				);
-			},
-		});
+		try {
+			ctx.compact({
+				customInstructions,
+				onComplete: () => {
+					resetCompactionRequest();
+					pi.sendUserMessage(
+						`[System Notice: Context compaction has completed successfully at ${new Date().toISOString()}. ` +
+							"Any compaction forewarning (<system-reminder> about an approaching context limit) with an " +
+							"earlier timestamp still visible in the kept history is now OBSOLETE — do not call " +
+							"request_compaction again unless the extension issues a brand-new forewarning. Please review " +
+							"your previous plan and resume your remaining work seamlessly.]",
+						{ deliverAs: "followUp" },
+					);
+				},
+				onError: () => {
+					resetCompactionRequest();
+					// The requesting run already terminated, so nothing would wake the
+					// agent up otherwise (in practice it used to linger until some
+					// unrelated notification happened to trigger a turn). Resume with a
+					// failure notice so work continues and a later retry stays possible.
+					pi.sendUserMessage(
+						"[System Notice: The requested context compaction failed or was aborted, so no compaction took " +
+							"place. Continue your work normally; you may call request_compaction again at the next clean " +
+							"boundary if the forewarning is still relevant.]",
+						{ deliverAs: "followUp" },
+					);
+				},
+			});
+		} catch {
+			// A synchronous throw (e.g. no model selected) never reaches onError;
+			// reset here or the pending flag would wedge the whole pipeline.
+			resetCompactionRequest();
+		}
 	};
 
 	pi.registerCommand(COMMAND, {
@@ -191,6 +209,9 @@ export default function compactForewarn(pi: ExtensionAPI): void {
 				};
 			}
 			pending = true;
+			// Published for the subagent plugin: from here until the compaction
+			// settles, notices must not ring the doorbell (see PENDING_SLOT).
+			sharedState[PENDING_SLOT] = true;
 
 			const nextSteps = (params as { next_steps?: string }).next_steps?.trim();
 			pendingInstructions = nextSteps
