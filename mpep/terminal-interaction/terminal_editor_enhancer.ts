@@ -1,7 +1,7 @@
 import { t } from "../shared/i18n/index.ts";
 import { type EditorVisualLineMap, getEditorVisualLineMaps } from "../shared/editor-visual-map.ts";
 import { CustomEditor, copyToClipboard, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { matchesKey, type TuiAltScreen, visibleWidth } from "@earendil-works/pi-tui";
+import { matchesKey, type TuiAltScreen, type TuiMouseEvent, type TuiMouseEventResult, visibleWidth } from "@earendil-works/pi-tui";
 import { installCursorMarkerGuard } from "./cursor-marker-guard.ts";
 
 interface EditorRange {
@@ -12,10 +12,27 @@ interface EditorRange {
 	selectedText: string;
 }
 
+/**
+ * Editor-internal selection (logical buffer coordinates), currently only produced by Ctrl+A.
+ *
+ * Why not reuse the terminal-native drag selection: the TuiAltScreen selection API is private and,
+ * more importantly, it operates on rendered screen rows. Editor lines scrolled out of the input
+ * box's visible window are not part of the rendered document at all, so a native "select all"
+ * could never cover them. An internal selection covers the whole buffer and flows through the
+ * same delete/copy/replace pipeline as the native selection (see handleInput).
+ */
+interface InternalSelection {
+	anchorLine: number;
+	anchorCol: number;
+	focusLine: number;
+	focusCol: number;
+}
+
 export class StylizedDesignEditor extends CustomEditor {
 	private readonly editorKeybindings: ConstructorParameters<typeof CustomEditor>[2];
 	private readonly normalBorderColor: CustomEditor["borderColor"];
 	private ctrlCPending: { timer: NodeJS.Timeout } | null = null;
+	private internalSelection: InternalSelection | null = null;
 
 	constructor(
 		tui: ConstructorParameters<typeof CustomEditor>[0],
@@ -286,13 +303,100 @@ export class StylizedDesignEditor extends CustomEditor {
 	/**
 	 * Clear the TUI-level selection highlight (anchor/focus state) and request a re-render.
 	 * Shared by the cut path and both copy paths so the highlight always disappears after the action.
+	 * Also collapses the editor-internal selection (Ctrl+A) so both selection kinds stay in sync.
 	 */
 	private clearActiveSelection(): void {
+		this.internalSelection = null;
 		const tui = this.tui as typeof this.tui & { clearTextSelection?: () => void };
 		if (tui && typeof tui.clearTextSelection === "function") {
 			tui.clearTextSelection();
 		}
 		tui?.requestRender?.();
+	}
+
+	/**
+	 * Collapse only the editor-internal selection (used when the mouse takes over: press/click).
+	 */
+	private clearInternalSelection(): void {
+		if (!this.internalSelection) return;
+		this.internalSelection = null;
+		this.tui?.requestRender?.();
+	}
+
+	/**
+	 * Ctrl+A: select the entire buffer and move the cursor to the selection end, like desktop editors.
+	 * This intentionally overrides pi's default ctrl+a binding (cursor to line start, emacs style);
+	 * line-start movement stays reachable via Home / Ctrl+Home.
+	 */
+	private selectAllBuffer(): void {
+		const lines: string[] = (this as any).state?.lines ?? [];
+		const lastLine = Math.max(0, lines.length - 1);
+		const lastCol = (lines[lastLine] ?? "").length;
+		// Empty buffer: nothing to select
+		if (lastLine === 0 && lastCol === 0) return;
+		this.internalSelection = { anchorLine: 0, anchorCol: 0, focusLine: lastLine, focusCol: lastCol };
+		(this as any).state.cursorLine = lastLine;
+		if (typeof (this as any).setCursorCol === "function") {
+			(this as any).setCursorCol(lastCol);
+		} else {
+			(this as any).state.cursorCol = lastCol;
+		}
+		this.tui?.requestRender?.();
+	}
+
+	/**
+	 * Normalize the editor-internal selection into an EditorRange (same shape the native drag
+	 * selection produces), so every downstream consumer (copy / cut / delete / replace) works
+	 * unchanged. Both ends are clamped into the current buffer, so a selection that went stale
+	 * after an external buffer change (undo, history, programmatic setText) degrades gracefully;
+	 * a fully out-of-range selection collapses to null.
+	 */
+	private getInternalSelectionRange(): EditorRange | null {
+		const sel = this.internalSelection;
+		if (!sel) return null;
+		const lines: string[] = (this as any).state?.lines ?? [];
+		if (lines.length === 0) {
+			this.internalSelection = null;
+			return null;
+		}
+
+		const anchorFirst =
+			sel.anchorLine < sel.focusLine || (sel.anchorLine === sel.focusLine && sel.anchorCol <= sel.focusCol);
+		const rawStart = anchorFirst ? { line: sel.anchorLine, col: sel.anchorCol } : { line: sel.focusLine, col: sel.focusCol };
+		const rawEnd = anchorFirst ? { line: sel.focusLine, col: sel.focusCol } : { line: sel.anchorLine, col: sel.anchorCol };
+
+		const clampPos = (pos: { line: number; col: number }) => {
+			const line = Math.max(0, Math.min(pos.line, lines.length - 1));
+			const col = Math.max(0, Math.min(pos.col, (lines[line] ?? "").length));
+			return { line, col };
+		};
+		const start = clampPos(rawStart);
+		const end = clampPos(rawEnd);
+		if (start.line === end.line && start.col === end.col) {
+			this.internalSelection = null;
+			return null;
+		}
+
+		// Slice the exact text from the buffer (identical logic to the native-selection path)
+		let selectedText = "";
+		if (start.line === end.line) {
+			selectedText = (lines[start.line] ?? "").slice(start.col, end.col);
+		} else {
+			const parts = [
+				(lines[start.line] ?? "").slice(start.col),
+				...lines.slice(start.line + 1, end.line),
+				(lines[end.line] ?? "").slice(0, end.col),
+			];
+			selectedText = parts.join("\n");
+		}
+
+		return {
+			startLine: start.line,
+			startCol: start.col,
+			endLine: end.line,
+			endCol: end.col,
+			selectedText,
+		};
 	}
 
 	override handleInput(data: string): void {
@@ -329,10 +433,18 @@ export class StylizedDesignEditor extends CustomEditor {
 			tui?.requestRender?.();
 		}
 
-		// 2. Check whether a selection is active
-		const selection = this.getEditorSelectionRange();
+		// 2. Ctrl+A -> select the entire buffer. Overrides pi's default ctrl+a binding (cursor to line
+		// start); line-start movement stays reachable via Home / Ctrl+Home.
+		if (matchesKey(data, "ctrl+a")) {
+			this.selectAllBuffer();
+			return;
+		}
 
-		// 3. Ctrl+C handling:
+		// 3. Check whether a selection is active: the editor-internal selection (Ctrl+A) wins over
+		// the terminal-native drag selection, and both share the same EditorRange pipeline below.
+		const selection = this.getInternalSelectionRange() ?? this.getEditorSelectionRange();
+
+		// 4. Ctrl+C handling:
 		// With a selection (inside the input box or a global chat-area selection) -> copy the selection to the clipboard, never clear the input area;
 		// Without a selection -> trigger the double-confirm exit to prevent accidental clearing
 		if (this.editorKeybindings.matches(data, "app.clear")) {
@@ -366,7 +478,7 @@ export class StylizedDesignEditor extends CustomEditor {
 			return;
 		}
 
-		// 4. Ctrl+X cut handling:
+		// 5. Ctrl+X cut handling:
 		// With a selection -> copy to the clipboard + delete the selection + show only the Cut! hint
 		// Without a selection -> keep the native message-copy behavior
 		const isCtrlX = data === "\x18" || this.editorKeybindings.matches(data, "app.message.copy");
@@ -377,17 +489,19 @@ export class StylizedDesignEditor extends CustomEditor {
 			return;
 		}
 
-		// 5. Cross-platform undo: support the generic Ctrl+- / Ctrl+_ and the system-configured undo key (Ctrl+Z on Windows)
+		// 6. Cross-platform undo: support the generic Ctrl+- / Ctrl+_ and the system-configured undo key (Ctrl+Z on Windows)
 		if (
 			matchesKey(data, "ctrl+-") ||
 			matchesKey(data, "ctrl+_") ||
 			this.editorKeybindings.matches(data, "tui.editor.undo")
 		) {
+			// The buffer is about to change, so the internal selection would go stale
+			this.internalSelection = null;
 			(this as any).undo?.();
 			return;
 		}
 
-		// 6. Backspace / delete with a selection: excise the selection content directly, leaving the cursor at its start
+		// 7. Backspace / delete with a selection: excise the selection content directly, leaving the cursor at its start
 		const isBackspace =
 			this.editorKeybindings.matches(data, "tui.editor.deleteCharBackward") ||
 			matchesKey(data, "backspace") ||
@@ -405,7 +519,7 @@ export class StylizedDesignEditor extends CustomEditor {
 			return;
 		}
 
-		// 7. Paste / typed input over a selection: excise the selection first, move the cursor back to its start, then insert the new characters
+		// 8. Paste / typed input over a selection: excise the selection first, move the cursor back to its start, then insert the new characters
 		const isPaste = data.includes("\x1b[200~");
 		const isPrintable = !data.startsWith("\x1b") && data.length >= 1 && data.charCodeAt(0) >= 32;
 
@@ -413,7 +527,88 @@ export class StylizedDesignEditor extends CustomEditor {
 			this.deleteSelectionRange(selection);
 		}
 
+		// 9. Escape with an internal selection: collapse the selection only, instead of letting the
+		// base editor trigger an interrupt (which could cancel a running generation).
+		if (this.internalSelection && (matchesKey(data, "escape") || this.editorKeybindings.matches(data, "app.interrupt"))) {
+			this.clearActiveSelection();
+			return;
+		}
+
+		// Any key that reaches the base editor (cursor moves, history navigation, etc.) collapses
+		// the internal selection first, mirroring desktop editors. (The copy/cut/delete paths above
+		// already cleared it through clearActiveSelection / deleteSelectionRange.)
+		if (this.internalSelection) {
+			this.internalSelection = null;
+			tui?.requestRender?.();
+		}
+
 		return super.handleInput(data);
+	}
+
+	/**
+	 * Mouse handling: the base editor deliberately leaves press/drag/release unhandled so the
+	 * renderer's native text selection keeps working over the input box, and it ignores wheel
+	 * events entirely (they fall through to the chat-area scroll). We add two behaviors on top:
+	 *
+	 * 1. Wheel over the input box scrolls the editor's own viewport by exactly one visual line
+	 *    per wheel event (only when the text actually overflows pi's height cap).
+	 * 2. Press/click collapses the editor-internal selection (Ctrl+A), like desktop editors.
+	 */
+	override handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+		const baseResult = super.handleMouse(event);
+		if (baseResult) {
+			// A click positions the cursor -> collapse any Ctrl+A selection
+			if (event.type === "click") this.clearInternalSelection();
+			return baseResult;
+		}
+		// Press/drag/release stay unhandled for the renderer's native selection, but a fresh press
+		// still collapses the internal selection.
+		if (event.type === "press") this.clearInternalSelection();
+		if (event.type !== "wheel" || !event.wheelDelta) return undefined;
+		return this.scrollByWheel(event.wheelDelta);
+	}
+
+	/**
+	 * Scroll the editor viewport by exactly one visual line per wheel event (the requested fixed
+	 * step; the platform's delta magnitude is intentionally ignored, only the direction matters).
+	 *
+	 * Editor.render() force-pulls scrollOffset back whenever the cursor would leave the visible
+	 * window, so a free-floating viewport is impossible without reimplementing render(). The
+	 * standard-editor compromise instead: the cursor stays put until the scroll would push it out
+	 * of the viewport, then it is dragged along by one line. This never fights render()'s
+	 * cursor-follow logic because the cursor always stays visible.
+	 *
+	 * Returns undefined when the text does not overflow the editor's height cap, so the wheel
+	 * event keeps its default behavior of scrolling the chat history.
+	 */
+	private scrollByWheel(wheelDelta: number): TuiMouseEventResult | undefined {
+		const internals = this as any;
+		if (typeof internals.layoutText !== "function") return undefined;
+		// Mirror Editor.render(): max visible lines = 30% of the terminal height, minimum 5
+		const maxVisibleLines = Math.max(5, Math.floor(this.tui.terminal.rows * 0.3));
+		// layoutText is what render() uses (path-links hooks it to lay out the reshaped text), so
+		// the line count and the cursor's visual index always match the frame on screen.
+		const layoutLines: Array<{ hasCursor?: boolean }> = internals.layoutText(internals.lastWidth ?? 80) ?? [];
+		if (layoutLines.length <= maxVisibleLines) return undefined;
+
+		const maxScrollOffset = layoutLines.length - maxVisibleLines;
+		const direction = wheelDelta < 0 ? -1 : 1;
+		const oldOffset: number = internals.scrollOffset ?? 0;
+		const newOffset = Math.max(0, Math.min(maxScrollOffset, oldOffset + direction));
+		if (newOffset === oldOffset) {
+			// At the scroll edge: still consume the event so the chat history doesn't jump-scroll
+			// when the user keeps spinning the wheel inside the input box.
+			return { handled: true, render: false };
+		}
+		internals.scrollOffset = newOffset;
+
+		// Drag the cursor along by one line when the scroll would push it out of the viewport.
+		const cursorVisualLine = layoutLines.findIndex((line) => line.hasCursor);
+		if (cursorVisualLine >= 0 && typeof internals.moveCursor === "function") {
+			if (cursorVisualLine < newOffset) internals.moveCursor(1, 0);
+			else if (cursorVisualLine >= newOffset + maxVisibleLines) internals.moveCursor(-1, 0);
+		}
+		return { handled: true, render: true };
 	}
 
 	protected override renderTopBorder(width: number, hiddenLineCount: number): string {
@@ -431,18 +626,119 @@ export class StylizedDesignEditor extends CustomEditor {
 		return super.renderTopBorder(width, hiddenLineCount);
 	}
 
+	/**
+	 * Paint the editor-internal selection onto the rendered rows with the same inverse-video style
+	 * (\x1b[7m...\x1b[27m) that the renderer uses for the native drag selection.
+	 *
+	 * Row geometry: rendered[0] is the top border, rows 1..renderedVisibleLineCount are the text
+	 * rows (layout lines scrollOffset..scrollOffset+count-1), then the bottom border and optional
+	 * autocomplete rows follow. Each text row is `leftPadding + displayText + padding +
+	 * rightPadding`, so cell 0 of the text sits at column paddingX.
+	 *
+	 * The selection lives in logical buffer coordinates while the rows show the *visual* text
+	 * (path-links may collapse paths into chips), so columns are translated through the visual map
+	 * the same way the mouse hit-testing already does.
+	 */
+	private overlaySelectionHighlight(rendered: string[], selection: EditorRange): string[] {
+		const internals = this as any;
+		const scrollOffset: number = internals.scrollOffset ?? 0;
+		const visibleCount: number = internals.renderedVisibleLineCount ?? 0;
+		const paddingX: number = internals.paddingX ?? 0;
+		const maps = getEditorVisualLineMaps(this);
+		const result = [...rendered];
+
+		for (let row = 1; row <= visibleCount; row++) {
+			const visualLineIndex = scrollOffset + row - 1;
+			const layoutRow = this.layOutRowAt(visualLineIndex, maps);
+			if (!layoutRow) continue;
+			if (layoutRow.line < selection.startLine || layoutRow.line > selection.endLine) continue;
+
+			const logicalLine: string = internals.state?.lines?.[layoutRow.line] ?? "";
+			const map = maps?.[layoutRow.line];
+			const toVisual = (logicalCol: number): number => {
+				const clamped = Math.max(0, Math.min(logicalCol, logicalLine.length));
+				if (!map) return clamped;
+				return map.toVisual[Math.min(clamped, map.toVisual.length - 1)] ?? clamped;
+			};
+
+			const selStartVisual = layoutRow.line === selection.startLine ? toVisual(selection.startCol) : 0;
+			const visualLineLength = map ? map.visual.length : logicalLine.length;
+			const selEndVisual = layoutRow.line === selection.endLine ? toVisual(selection.endCol) : visualLineLength;
+
+			// Intersect the selection with the visual column range this row actually shows
+			const rowStart = layoutRow.startCol;
+			const rowEnd = layoutRow.startCol + layoutRow.text.length;
+			const hlStart = Math.max(selStartVisual, rowStart);
+			const hlEnd = Math.min(selEndVisual, rowEnd);
+			if (hlStart >= hlEnd) continue;
+
+			const startCell = paddingX + visibleWidth(layoutRow.text.slice(0, hlStart - rowStart));
+			const endCell = paddingX + visibleWidth(layoutRow.text.slice(0, hlEnd - rowStart));
+			result[row] = StylizedDesignEditor.applyInverseRange(result[row], startCell, endCell);
+		}
+		return result;
+	}
+
+	/**
+	 * Wrap the terminal cells [startCell, endCell) of a rendered row in inverse video.
+	 * ANSI escape sequences (CSI colors, OSC-8 hyperlinks, pi's APC-style cursor marker) occupy
+	 * no cells and are skipped; printable text is walked grapheme by grapheme so wide characters
+	 * (CJK, emoji) count as two cells. SGR 27 only clears inverse, so any styling active around
+	 * the highlighted span (chip colors, hyperlinks) survives untouched.
+	 */
+	private static applyInverseRange(row: string, startCell: number, endCell: number): string {
+		// CSI (\x1b[...final), OSC (\x1b]...BEL/ST), APC-style (\x1b_...BEL/ST, e.g. the cursor marker)
+		const escapeRe = /\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|_[^\x07\x1b]*(?:\x07|\x1b\\))/y;
+		const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+		let out = "";
+		let col = 0;
+		let i = 0;
+		let inSelection = false;
+		while (i < row.length) {
+			escapeRe.lastIndex = i;
+			const escapeMatch = escapeRe.exec(row);
+			if (escapeMatch && escapeMatch.index === i) {
+				out += escapeMatch[0];
+				i += escapeMatch[0].length;
+				continue;
+			}
+			const grapheme = segmenter.segment(row.slice(i)).containing(0)?.segment ?? row[i];
+			const cellStart = col;
+			const cellEnd = col + visibleWidth(grapheme);
+			const selected = cellStart < endCell && cellEnd > startCell;
+			if (selected && !inSelection) {
+				out += "\x1b[7m";
+				inSelection = true;
+			} else if (!selected && inSelection) {
+				out += "\x1b[27m";
+				inSelection = false;
+			}
+			out += grapheme;
+			col = cellEnd;
+			i += grapheme.length;
+		}
+		if (inSelection) out += "\x1b[27m";
+		return out;
+	}
+
 	render(width: number): string[] {
 		// Pi reapplies thinking colors; keep normal input neutral and preserve command-mode colors.
 		if (!this.getText().trimStart().startsWith("!")) {
 			this.borderColor = this.normalBorderColor;
 		}
-		const lines = super.render(width);
 		// Remove the ANSI inverse-video block style (\x1b[7m) but keep the CURSOR_MARKER, so the terminal's hardware bar cursor aligns precisely with the text position
-		return lines.map((line) =>
-			line.replace(/(\x1b_pi:c\x07)?\x1b\[7m([^\x1b]+)\x1b\[0m/g, (_match, marker, char) => {
-				return (marker || "") + char;
-			}),
-		);
+		const lines = super
+			.render(width)
+			.map((line) =>
+				line.replace(/(\x1b_pi:c\x07)?\x1b\[7m([^\x1b]+)\x1b\[0m/g, (_match, marker, char) => {
+					return (marker || "") + char;
+				}),
+			);
+		// Paint the Ctrl+A selection on top (after the cursor-block strip, so the two inverse-video
+		// users never confuse each other's sequences)
+		const selection = this.getInternalSelectionRange();
+		if (!selection) return lines;
+		return this.overlaySelectionHighlight(lines, selection);
 	}
 }
 
