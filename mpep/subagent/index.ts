@@ -205,17 +205,10 @@ export default function (pi: ExtensionAPI): void {
 			// shutdown clears the whole registry, so any async continuation must
 			// then stay silent (no ghost writes, no ghost notifications).
 			const stillRegistered = () => currentPool.get(instance.meta.id) === instance;
-			const notify = (content: string) => {
-				try {
-					pi.sendMessage(
-						{ customType: "mpep-subagent-notice", display: false, content },
-						{ triggerTurn: true, deliverAs: "steer" },
-					);
-				} catch {
-					// During reload/shutdown the old extension context is already
-					// invalidated; the instance stays discoverable via subagent_list.
-				}
-			};
+			// Notifications route through the compaction guard: while a compaction
+			// is in flight they are held and flushed once it settles, so a wake-up
+			// can never start a run mid-compaction (see the guard below).
+			const notify = queueNotice;
 			// Persist the mailbox and announce the delivery: result.md holds the
 			// deliverable, meta holds the unread mark, so a main-session restart
 			// never loses a result.
@@ -1048,6 +1041,65 @@ export default function (pi: ExtensionAPI): void {
 
 	// ---- Session lifecycle: recovery scan, reminder injection, sweep, cleanup ----
 
+	// Compaction-in-flight notice guard. Pi's sendCustomMessage triggerTurn path
+	// calls _runAgentPrompt directly and, unlike prompt(), never checks
+	// isCompacting — so a completion notice landing while a compaction is
+	// running would start an agent run DURING compaction. The compaction_end
+	// full chat rebuild then destroys that run's streaming component, leaving
+	// the session visibly "running" with nothing on screen. Hold notices from
+	// session_before_compact until the compaction settles, then flush them.
+	let compactionInFlight = false;
+	const compactionHeldNotices: string[] = [];
+	let compactionFlushTimer: ReturnType<typeof setTimeout> | undefined;
+
+	const sendNotice = (content: string) => {
+		try {
+			pi.sendMessage(
+				{ customType: "mpep-subagent-notice", display: false, content },
+				{ triggerTurn: true, deliverAs: "steer" },
+			);
+		} catch {
+			// During reload/shutdown the old extension context is already
+			// invalidated; the instance stays discoverable via subagent_list.
+		}
+	};
+
+	// Notices are identical in kind, so holding and later flushing each one is
+	// both simpler and safer than coalescing (no per-instance state to track).
+	const queueNotice = (content: string) => {
+		if (compactionInFlight) {
+			compactionHeldNotices.push(content);
+			return;
+		}
+		sendNotice(content);
+	};
+
+	pi.on("session_before_compact", () => {
+		compactionInFlight = true;
+		// A new compaction supersedes any flush scheduled by the previous one.
+		if (compactionFlushTimer) {
+			clearTimeout(compactionFlushTimer);
+			compactionFlushTimer = undefined;
+		}
+	});
+
+	const scheduleNoticeFlush = () => {
+		compactionInFlight = false;
+		if (compactionFlushTimer) clearTimeout(compactionFlushTimer);
+		// session_compact fires before Pi clears its compaction controller, so
+		// an immediate triggerTurn prompt would still be rejected. A short delay
+		// lands safely past compaction_end.
+		compactionFlushTimer = setTimeout(() => {
+			compactionFlushTimer = undefined;
+			if (compactionInFlight) return;
+			for (const content of compactionHeldNotices.splice(0)) sendNotice(content);
+		}, 1000);
+		compactionFlushTimer.unref?.();
+	};
+
+	pi.on("session_compact", scheduleNoticeFlush);
+	pi.on("session_compact_failed", scheduleNoticeFlush);
+
 	pi.on("session_start", (_event, context) => {
 		ctx = context;
 		poolSessionId = context.sessionManager.getSessionId() || `pid-${process.pid}`;
@@ -1129,6 +1181,10 @@ export default function (pi: ExtensionAPI): void {
 		process.off("exit", killAll);
 		process.off("SIGINT", onSigint);
 		process.off("SIGTERM", onSigterm);
+		if (compactionFlushTimer) {
+			clearTimeout(compactionFlushTimer);
+			compactionFlushTimer = undefined;
+		}
 		try {
 			widget?.dispose();
 		} catch {
