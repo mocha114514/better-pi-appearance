@@ -1,4 +1,5 @@
 import { type Component, type TuiMouseEvent, type TuiMouseEventResult, visibleWidth } from "@earendil-works/pi-tui";
+import { decorateFrame, type FramePiece } from "../shared/selection-markers.ts";
 
 /**
  * Bubble box container that wraps child components in a rounded border
@@ -98,24 +99,42 @@ export class UserBubbleBox implements Component {
 		const leftMargin = " ".repeat(effectivePad);
 		const rightMargin = " ".repeat(Math.max(0, width - effectivePad - boxWidth));
 
-		const topBorder = leftMargin + border(`╭${"─".repeat(innerWidth)}╮`) + rightMargin;
-		const bottomBorder = leftMargin + border(`╰${"─".repeat(innerWidth)}╯`) + rightMargin;
-
-		const result: string[] = [topBorder];
-		for (const line of childLines) {
-			const visLen = visibleWidth(line);
-			const padNeeded = Math.max(0, contentWidth - visLen);
-			const borderedLine =
-				leftMargin +
-				border("│ ") +
-				line +
-				" ".repeat(padNeeded) +
-				border(" │") +
-				rightMargin;
-			result.push(borderedLine);
+		// Same frame markers as code blocks: a selection copy keeps the text inside
+		// the rounded border and drops the vertical bars and corner rules.
+		const pieces: FramePiece[] = [
+			{
+				role: "top",
+				line: border(`╭${"─".repeat(innerWidth)}╮`),
+				left: 0,
+				right: 0,
+				src: 0,
+				part: 0,
+				partCount: 1,
+			},
+		];
+		for (let index = 0; index < childLines.length; index++) {
+			const line = childLines[index] ?? "";
+			const padNeeded = Math.max(0, contentWidth - visibleWidth(line));
+			pieces.push({
+				role: "body",
+				line: border("│ ") + line + " ".repeat(padNeeded) + border(" │"),
+				left: 2,
+				right: 2,
+				src: index,
+				part: 0,
+				partCount: 1,
+			});
 		}
-		result.push(bottomBorder);
+		pieces.push({
+			role: "bottom",
+			line: border(`╰${"─".repeat(innerWidth)}╯`),
+			left: 0,
+			right: 0,
+			src: 0,
+			part: 0,
+			partCount: 1,
+		});
 
-		return result;
+		return decorateFrame(pieces, boxWidth).map((line) => leftMargin + line + rightMargin);
 	}
 }

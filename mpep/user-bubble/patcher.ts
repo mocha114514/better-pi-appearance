@@ -1,5 +1,6 @@
 import { UserMessageComponent } from "@earendil-works/pi-coding-agent";
 import type { Theme } from "@earendil-works/pi-coding-agent";
+import { installSelectionCopy } from "../shared/selection-copy.ts";
 import { UserBubbleBox } from "./bubble_component.ts";
 
 export type BubbleTheme = Pick<Theme, "fg">;
@@ -34,6 +35,9 @@ const patches = globalThis as unknown as Record<symbol, (() => void) | undefined
  */
 export function setupUserBubble(): () => void {
 	patches[patchSlot]?.();
+	// Own a selection-copy holder so the bubble markers are stripped before the
+	// frame is written even when the markdown enhancer is disabled.
+	const releaseSelection = installSelectionCopy();
 
 	const proto = UserMessageComponent.prototype as unknown as {
 		rebuild: () => void;
@@ -92,6 +96,7 @@ export function setupUserBubble(): () => void {
 	const installedRebuild = proto.rebuild;
 
 	const dispose = () => {
+		releaseSelection();
 		if (proto.rebuild === installedRebuild) {
 			proto.rebuild = originalRebuild;
 		}

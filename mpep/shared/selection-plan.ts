@@ -293,6 +293,24 @@ function planBlocks(
 				continue;
 			}
 			highlight.set(row.row, { kind: "span", start, end });
+			const slice = expandCopiedText(sliceByColumn(row.line, start, end - start, true)).trimEnd();
+			const full = stream.start <= inner.start && stream.end >= inner.end;
+			// Prose inside a bubble or other frame still rejoins, but the slice stays
+			// inside the border. The frame marker is the line prefix, so the wrap
+			// payload must not pick the bars back up.
+			const wrap = row.parsed.wrap;
+			if (wrap) {
+				pieces.push({
+					kind: "wrap",
+					row: row.row,
+					id: wrap.id,
+					part: wrap.part,
+					partCount: wrap.partCount,
+					full,
+					slice,
+				});
+				continue;
+			}
 			pieces.push({
 				kind: "frame",
 				row: row.row,
@@ -300,8 +318,8 @@ function planBlocks(
 				src: frame.src,
 				part: frame.part,
 				partCount: frame.partCount,
-				full: stream.start <= inner.start && stream.end >= inner.end,
-				slice: expandCopiedText(sliceByColumn(row.line, start, end - start, true)).trimEnd(),
+				full,
+				slice,
 			});
 			continue;
 		}
@@ -324,6 +342,43 @@ function planBlocks(
 	}
 
 	return { highlight, lines: collapsePieces(lines, pieces) };
+}
+
+/**
+ * A one-row drag normally stays a stream slice, which is what a partial code
+ * line needs. Frame chrome is the exception: a drag that runs into the border
+ * still copies only the inside. A drag already inside the frame returns null.
+ */
+function planSingleFrameRow(
+	lines: readonly string[],
+	selection: SelectionBounds,
+	columns: ColumnFn,
+): SelectionPlan | null {
+	if (selection.start.row !== selection.end.row) return null;
+	const row = selection.start.row;
+	const line = lines[row] ?? "";
+	const parsed = parseSelectionMarkers(line);
+	const inner = frameInner(parsed);
+	if (!parsed.frame || !inner) return null;
+	const stream = columns(line, row, selection);
+	if (stream.start >= inner.start && stream.end <= inner.end) return null;
+	const start = Math.max(stream.start, inner.start);
+	const end = Math.min(stream.end, inner.end);
+	const highlight = new Map<number, HighlightAction>();
+	if (end <= start) {
+		highlight.set(row, { kind: "none" });
+		return { highlight, lines: [] };
+	}
+	highlight.set(row, { kind: "span", start, end });
+	const wrap = parsed.wrap;
+	const coversInside = stream.start <= inner.start && stream.end >= inner.end;
+	if (wrap && coversInside && wrap.part === 0 && wrap.partCount === 1 && parsed.wrapText !== undefined) {
+		return { highlight, lines: [expandCopiedText(parsed.wrapText).replace(/\r$/, "")] };
+	}
+	return {
+		highlight,
+		lines: [expandCopiedText(sliceByColumn(line, start, end - start, true)).trimEnd()],
+	};
 }
 
 function groupIsComplete(group: readonly FramePieceCopy[], source: string[] | undefined): boolean {
@@ -394,7 +449,10 @@ function collapsePieces(lines: readonly string[], pieces: readonly CopyPiece[]):
 			if (complete) {
 				// Keep the first visual line's prefix (list bullet, quote border, padding) once;
 				// continuation lines repeat only indent, which the payload already replaces.
-				const prefix = wrapPrefix(lines[group[0]?.row ?? -1] ?? "");
+				// A frame around the wrap (user bubble, code card) owns that prefix; its
+				// bars are not part of the logical text.
+				const head = lines[group[0]?.row ?? -1] ?? "";
+				const prefix = parseSelectionMarkers(head).frame ? "" : wrapPrefix(head);
 				collapsed.push(expandCopiedText(prefix + text).replace(/\r$/, ""));
 				continue;
 			}
@@ -438,7 +496,11 @@ export function planSelection(
 		rows.push({ row, line, parsed: parseSelectionMarkers(line) });
 	}
 	if (!sawMarker) return null;
-	return planTable(lines, rows, selection) ?? planBlocks(lines, rows, selection, columns);
+	return (
+		planTable(lines, rows, selection) ??
+		planBlocks(lines, rows, selection, columns) ??
+		planSingleFrameRow(lines, selection, columns)
+	);
 }
 
 export function resolveHighlightColumns(
