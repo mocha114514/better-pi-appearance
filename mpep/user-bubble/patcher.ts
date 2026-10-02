@@ -50,10 +50,35 @@ export function setupUserBubble(): () => void {
 		// and text content components are fully constructed.
 		originalRebuild.call(this);
 
-		const originalBox = this.children?.[0] as { children?: unknown[] } | undefined;
-		const markdownChild = originalBox?.children?.[0];
+		const firstChild = this.children?.[0] as { children?: unknown[] } | undefined;
+		// Component tree differs across pi versions:
+		//   pi < 1.0:  UserMessageComponent -> Box -> Markdown
+		//   pi >= 1.0: UserMessageComponent -> Markdown
+		// (upstream commit e792ba131 removed the Box wrapper; the Markdown
+		// now paints its own background and padding instead).
+		const markdownChild = (firstChild?.children?.[0] ?? firstChild) as
+			| {
+					paddingX?: number;
+					paddingY?: number;
+					defaultTextStyle?: { bgColor?: (text: string) => string };
+					invalidate?: () => void;
+				}
+			| undefined;
 
 		if (markdownChild) {
+			// On pi >= 1.0 the Markdown fills a solid userMessageBg background
+			// and adds output padding on its own. Strip both so the bubble keeps
+			// its original transparent look; the border provides the framing.
+			// These are no-ops on older versions (no bgColor, padding already 0).
+			// The defaultTextStyle object is freshly created per rebuild, so
+			// mutating it affects only this message instance.
+			if (markdownChild.defaultTextStyle) {
+				delete markdownChild.defaultTextStyle.bgColor;
+			}
+			markdownChild.paddingX = 0;
+			markdownChild.paddingY = 0;
+			markdownChild.invalidate?.();
+
 			this.clear();
 			const bubbleBox = new UserBubbleBox(
 				this.outputPad ?? 1,
