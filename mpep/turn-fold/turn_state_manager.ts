@@ -393,7 +393,12 @@ export function syncFromSessionHistory(
 			sealActiveGroup();
 			completeProcessFolds();
 		} else if (entry.type === "custom_message") {
-			if (!claimHistoryCustomMessage(entry, entries, index)) {
+			// Invisible context injections (display:false, e.g. subagent notices and
+			// compaction forewarnings) are never boundaries, matching the live
+			// message_start path. Without this check the replay splits a fold at
+			// every invisible message that the live path correctly ignored.
+			const display = (entry as { display?: boolean }).display;
+			if (display !== false && !claimHistoryCustomMessage(entry, entries, index)) {
 				sealActiveGroup();
 				completeProcessFolds();
 			}
