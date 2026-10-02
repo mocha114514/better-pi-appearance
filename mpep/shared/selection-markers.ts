@@ -40,6 +40,12 @@ export interface FrameMarker {
 	partCount: number;
 }
 
+export interface WrapMarker {
+	id: number;
+	part: number;
+	partCount: number;
+}
+
 export interface ParsedMarkers {
 	/** Visible column where the marker sits (after left padding and any leading SGR). */
 	origin: number;
@@ -47,6 +53,9 @@ export interface ParsedMarkers {
 	tableRows?: string[][];
 	frame?: FrameMarker;
 	frameSource?: string[];
+	wrap?: WrapMarker;
+	/** Plain text of the whole logical line, attached to part 0 of a wrap group. */
+	wrapText?: string;
 }
 
 export interface FramePiece {
@@ -123,6 +132,18 @@ export function decorateFrame(pieces: readonly FramePiece[], frameWidth: number,
 	});
 }
 
+/**
+ * Mark the soft-wrapped visual parts of one logical prose line.
+ * `plainText` is the unwrapped visible text (ANSI already stripped); it rides on part 0
+ * so a copy that covers every part can rejoin the visual rows into the real line.
+ */
+export function markWrapLines(parts: readonly string[], plainText: string): string[] {
+	if (parts.length === 0) return [];
+	const id = allocSelectionBlockId();
+	const payload = osc(`p|${id}|${encodeJson(plainText)}`);
+	return parts.map((part, index) => osc(`w|${id}|${index}|${parts.length}`) + (index === 0 ? payload : "") + part);
+}
+
 export function stripSelectionMarkers(value: string): string {
 	if (!value.includes(SELECTION_MARKER_PREFIX)) return value;
 	return value.replace(/\x1b\]777;mpep;[^\x07]*\x07/g, "");
@@ -163,6 +184,23 @@ function applyPayload(parsed: ParsedMarkers, payload: string): void {
 		try {
 			const source = asStringList(decodeJson(bits.slice(2).join("|")));
 			if (source) parsed.frameSource = source;
+		} catch {
+			// Same fallback as table data: visual slices still work.
+		}
+		return;
+	}
+	if (kind === "w") {
+		const id = Number.parseInt(bits[1] ?? "", 10);
+		const part = Number.parseInt(bits[2] ?? "", 10);
+		const partCount = Number.parseInt(bits[3] ?? "", 10);
+		if ([id, part, partCount].some((value) => !Number.isFinite(value))) return;
+		parsed.wrap = { id, part, partCount };
+		return;
+	}
+	if (kind === "p") {
+		try {
+			const text = decodeJson(bits.slice(2).join("|"));
+			if (typeof text === "string") parsed.wrapText = text;
 		} catch {
 			// Same fallback as table data: visual slices still work.
 		}

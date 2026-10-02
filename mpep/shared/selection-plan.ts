@@ -1,12 +1,14 @@
-// Turn a terminal stream selection into table-cell or code-frame clipboard text,
-// and into the highlight ranges that match that text.
+// Turn a terminal stream selection into table-cell, code-frame, or rejoined-prose
+// clipboard text, and into the highlight ranges that match that text.
 //
 // Stream selection copies the whole middle row. Inside a table that includes
-// columns the pointer never touched; inside a code block it includes the border.
-// Both are fixed here, and only here: a drag that also covers ordinary prose keeps
-// the stream, so selecting a paragraph does not suddenly drop table columns.
+// columns the pointer never touched; inside a code block it includes the border;
+// inside prose it keeps the terminal's soft wraps as hard newlines. All three are
+// fixed here, and only here: a drag that also covers ordinary unmarked lines keeps
+// the stream for those lines, so selecting a paragraph does not suddenly drop
+// table columns.
 
-import { sliceByColumn, stripTerminalSequences } from "@earendil-works/pi-tui";
+import { sliceByColumn, stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import {
 	SELECTION_MARKER_PREFIX,
 	parseSelectionMarkers,
@@ -79,7 +81,17 @@ interface FramePieceCopy {
 	slice: string;
 }
 
-type CopyPiece = { kind: "line"; text: string } | FramePieceCopy;
+interface WrapPieceCopy {
+	kind: "wrap";
+	row: number;
+	id: number;
+	part: number;
+	partCount: number;
+	full: boolean;
+	slice: string;
+}
+
+type CopyPiece = { kind: "line"; text: string } | FramePieceCopy | WrapPieceCopy;
 
 function isBlankLine(line: string): boolean {
 	return stripSelectionMarkers(line).trim() === "";
@@ -242,46 +254,76 @@ function frameInner(parsed: ParsedMarkers): { start: number; end: number } | und
 	return { start, end };
 }
 
-function planFrame(
+/** Visible column just after the last non-padding character. Margins sit left of the marker, so this is measured from column 0. */
+function wrapContentEnd(line: string): number {
+	return visibleWidth(stripTerminalSequences(stripSelectionMarkers(line)).trimEnd());
+}
+
+/** Indent, list marker, or quote border that renderers place before the wrap marker. */
+function wrapPrefix(line: string): string {
+	const markerAt = line.indexOf(SELECTION_MARKER_PREFIX);
+	if (markerAt <= 0) return "";
+	return stripTerminalSequences(line.slice(0, markerAt));
+}
+
+function planBlocks(
 	lines: readonly string[],
 	rows: readonly RowRef[],
 	selection: SelectionBounds,
 	columns: ColumnFn,
 ): SelectionPlan | null {
 	if (selection.end.row <= selection.start.row) return null;
-	if (!rows.some((row) => row.parsed.frame)) return null;
+	if (!rows.some((row) => row.parsed.frame || row.parsed.wrap)) return null;
 
 	const highlight = new Map<number, HighlightAction>();
 	const pieces: CopyPiece[] = [];
 	for (const row of rows) {
 		const frame = row.parsed.frame;
 		const inner = frameInner(row.parsed);
-		if (!frame || !inner) {
-			if (frame) highlight.set(row.row, { kind: "none" });
-			else pieces.push({ kind: "line", text: streamCopy(row.line, row.row, selection, columns) });
-			continue;
-		}
-		const stream = columns(row.line, row.row, selection);
-		const start = Math.max(stream.start, inner.start);
-		const end = Math.min(stream.end, inner.end);
-		if (end <= start) {
+		if (frame && !inner) {
 			highlight.set(row.row, { kind: "none" });
 			continue;
 		}
-		highlight.set(row.row, { kind: "span", start, end });
+		if (frame && inner) {
+			const stream = columns(row.line, row.row, selection);
+			const start = Math.max(stream.start, inner.start);
+			const end = Math.min(stream.end, inner.end);
+			if (end <= start) {
+				highlight.set(row.row, { kind: "none" });
+				continue;
+			}
+			highlight.set(row.row, { kind: "span", start, end });
+			pieces.push({
+				kind: "frame",
+				row: row.row,
+				id: frame.id,
+				src: frame.src,
+				part: frame.part,
+				partCount: frame.partCount,
+				full: stream.start <= inner.start && stream.end >= inner.end,
+				slice: expandCopiedText(sliceByColumn(row.line, start, end - start, true)).trimEnd(),
+			});
+			continue;
+		}
+		const wrap = row.parsed.wrap;
+		if (!wrap) {
+			pieces.push({ kind: "line", text: streamCopy(row.line, row.row, selection, columns) });
+			continue;
+		}
+		// Wrap rows keep the stream highlight; only the clipboard text changes.
+		const stream = columns(row.line, row.row, selection);
 		pieces.push({
-			kind: "frame",
+			kind: "wrap",
 			row: row.row,
-			id: frame.id,
-			src: frame.src,
-			part: frame.part,
-			partCount: frame.partCount,
-			full: stream.start <= inner.start && stream.end >= inner.end,
-			slice: expandCopiedText(sliceByColumn(row.line, start, end - start, true)).trimEnd(),
+			id: wrap.id,
+			part: wrap.part,
+			partCount: wrap.partCount,
+			full: stream.start <= row.parsed.origin && stream.end >= wrapContentEnd(row.line),
+			slice: streamCopy(row.line, row.row, selection, columns),
 		});
 	}
 
-	return { highlight, lines: collapseFramePieces(lines, pieces) };
+	return { highlight, lines: collapsePieces(lines, pieces) };
 }
 
 function groupIsComplete(group: readonly FramePieceCopy[], source: string[] | undefined): boolean {
@@ -292,7 +334,7 @@ function groupIsComplete(group: readonly FramePieceCopy[], source: string[] | un
 	);
 }
 
-function collapseFramePieces(lines: readonly string[], pieces: readonly CopyPiece[]): string[] {
+function collapsePieces(lines: readonly string[], pieces: readonly CopyPiece[]): string[] {
 	const sources = new Map<number, string[] | undefined>();
 	const sourceFor = (piece: FramePieceCopy): string[] | undefined => {
 		const cached = sources.get(piece.id);
@@ -305,6 +347,26 @@ function collapseFramePieces(lines: readonly string[], pieces: readonly CopyPiec
 		sources.set(piece.id, found);
 		return found;
 	};
+	const wrapTexts = new Map<number, string | undefined>();
+	const wrapTextFor = (piece: WrapPieceCopy): string | undefined => {
+		const cached = wrapTexts.get(piece.id);
+		if (cached !== undefined || wrapTexts.has(piece.id)) return cached;
+		// Parts of one logical line are consecutive rows sharing the id; stop at the first
+		// row that belongs to something else instead of scanning the whole document.
+		let found: string | undefined;
+		for (let row = piece.row; row >= 0; row--) {
+			const line = lines[row] ?? "";
+			if (!line.includes(SELECTION_MARKER_PREFIX)) break;
+			const parsed = parseSelectionMarkers(line);
+			if (parsed.wrap?.id !== piece.id) break;
+			if (parsed.wrapText !== undefined) {
+				found = parsed.wrapText;
+				break;
+			}
+		}
+		wrapTexts.set(piece.id, found);
+		return found;
+	};
 
 	const collapsed: string[] = [];
 	let index = 0;
@@ -313,6 +375,30 @@ function collapseFramePieces(lines: readonly string[], pieces: readonly CopyPiec
 		if (!piece || piece.kind === "line") {
 			collapsed.push(piece?.kind === "line" ? piece.text : "");
 			index += 1;
+			continue;
+		}
+		if (piece.kind === "wrap") {
+			const group: WrapPieceCopy[] = [piece];
+			index += 1;
+			while (index < pieces.length) {
+				const next = pieces[index];
+				if (!next || next.kind !== "wrap" || next.id !== piece.id) break;
+				group.push(next);
+				index += 1;
+			}
+			const text = wrapTextFor(piece);
+			const complete =
+				text !== undefined &&
+				group.length === piece.partCount &&
+				group.every((part, partIndex) => part.full && part.part === partIndex);
+			if (complete) {
+				// Keep the first visual line's prefix (list bullet, quote border, padding) once;
+				// continuation lines repeat only indent, which the payload already replaces.
+				const prefix = wrapPrefix(lines[group[0]?.row ?? -1] ?? "");
+				collapsed.push(expandCopiedText(prefix + text).replace(/\r$/, ""));
+				continue;
+			}
+			for (const part of group) collapsed.push(part.slice);
 			continue;
 		}
 		const group: FramePieceCopy[] = [piece];
@@ -352,7 +438,7 @@ export function planSelection(
 		rows.push({ row, line, parsed: parseSelectionMarkers(line) });
 	}
 	if (!sawMarker) return null;
-	return planTable(lines, rows, selection) ?? planFrame(lines, rows, selection, columns);
+	return planTable(lines, rows, selection) ?? planBlocks(lines, rows, selection, columns);
 }
 
 export function resolveHighlightColumns(

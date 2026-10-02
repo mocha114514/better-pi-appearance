@@ -3,12 +3,20 @@
 // can be toggled independently via the markdown-enhancer plugin entry.
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Markdown, type MarkdownTheme, renderLatex, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import {
+	Markdown,
+	type MarkdownTheme,
+	renderLatex,
+	stripTerminalSequences,
+	visibleWidth,
+	wrapTextWithAnsi,
+} from "@earendil-works/pi-tui";
 import { installSelectionCopy } from "../shared/selection-copy.ts";
 import {
 	allocSelectionBlockId,
 	decorateFrame,
 	markTableLine,
+	markWrapLines,
 	type CellBox,
 	type FramePiece,
 } from "../shared/selection-markers.ts";
@@ -911,6 +919,69 @@ export function applyMathPatch(): () => void {
 }
 
 /**
+ * Kitty / iTerm2 image sequences must never be wrapped or marked: the outer
+ * Markdown.render loop skips them too (isImageLine is not exported publicly).
+ */
+const KITTY_IMAGE_PREFIX = "\x1b_G";
+const ITERM2_IMAGE_PREFIX = "\x1b]1337;File=";
+
+function isImageContentLine(line: string): boolean {
+	return line.includes(KITTY_IMAGE_PREFIX) || line.includes(ITERM2_IMAGE_PREFIX);
+}
+
+/**
+ * Patch Markdown.prototype.renderToken so prose (paragraph / text tokens) is wrapped
+ * here instead of in the outer render() loop, tagging every soft-wrapped visual part
+ * with a wrap marker. The plain unwrapped text rides on part 0, letting selection copy
+ * rejoin visual rows that only broke because the terminal ran out of width.
+ *
+ * The width passed in matches every later wrap exactly (content width at top level,
+ * item width in lists, quote content width in blockquotes), so the downstream wraps
+ * become no-ops and the rendered frame is pixel-identical to the unpatched output.
+ */
+export function applyProseWrapPatch(): () => void {
+	const proto = Markdown.prototype as any;
+	let active = true;
+
+	const originalRenderToken = proto.renderToken;
+	proto.renderToken = function (token: any, width: number, nextTokenType?: string, styleContext?: any): string[] {
+		// Delegate through the patch chain first so bold/heading/math enhancements keep working.
+		const rendered = originalRenderToken.call(this, token, width, nextTokenType, styleContext);
+		if (!active || (token?.type !== "paragraph" && token?.type !== "text" && token?.type !== "heading")) {
+			return rendered;
+		}
+		try {
+			const wrapWidth = Math.max(1, width);
+			const marked: string[] = [];
+			for (const line of rendered) {
+				if (!line || !line.trim() || isImageContentLine(line)) {
+					// Spacing lines and images carry no prose; leave them untouched.
+					marked.push(line);
+					continue;
+				}
+				// Explicit line breaks (hard breaks) split into independent logical lines.
+				for (const piece of line.split("\n")) {
+					if (!piece.trim()) {
+						marked.push(piece);
+						continue;
+					}
+					const parts = wrapTextWithAnsi(piece, wrapWidth);
+					marked.push(...markWrapLines(parts, stripTerminalSequences(piece).trimEnd()));
+				}
+			}
+			return marked;
+		} catch {
+			return rendered;
+		}
+	};
+	const installed = proto.renderToken;
+	return () => {
+		active = false;
+		if (proto.renderToken === installed) proto.renderToken = originalRenderToken;
+	};
+}
+
+/**
  * Setup Markdown enhancements:
  * - Prototype patches on Markdown component (lists, code blocks, tables, headings, bold text, math formulas)
  * - Markdown transformer registration (callouts, headings, bold syntax, inline symbols, math protection)
@@ -923,6 +994,7 @@ export function setupMarkdownEnhancements(pi: ExtensionAPI): () => void {
 	const disposeBold = applyBoldPatch();
 	const disposeHeading = applyHeadingPatch();
 	const disposeMath = applyMathPatch();
+	const disposeProseWrap = applyProseWrapPatch();
 	const releaseSelection = installSelectionCopy();
 	let active = true;
 	const dispose = () => {
@@ -930,6 +1002,7 @@ export function setupMarkdownEnhancements(pi: ExtensionAPI): () => void {
 		active = false;
 		// Each patch wraps renderToken after the previous one, so unwind in reverse order.
 		releaseSelection();
+		disposeProseWrap();
 		disposeMath();
 		disposeHeading();
 		disposeBold();
