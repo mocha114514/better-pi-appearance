@@ -4,6 +4,7 @@
 // path-links does not bring back whole-row table copies.
 
 import { TuiAltScreen, visibleWidth } from "@earendil-works/pi-tui";
+import { installNativeTerminalWrap } from "./native-terminal-wrap.ts";
 import { installSelectionMarkerStrip } from "./selection-markers.ts";
 import {
 	planSelection,
@@ -165,8 +166,12 @@ function mount(): (() => void) | undefined {
 	// Markers have to stay out of the terminal even after the renderer is disabled,
 	// because already-built lines can still be on screen for a frame.
 	const releaseStrip = installSelectionMarkerStrip();
+	// The native-wrap bridge parses the markers above before the strip hook erases
+	// them, so it must be installed after the strip and released alongside it.
+	const releaseWrap = installNativeTerminalWrap();
 
 	return () => {
+		releaseWrap();
 		releaseStrip();
 		if (proto.getActiveSelectionText === installedText) proto.getActiveSelectionText = originalText;
 		if (proto.getSelectionColumns === installedColumns) proto.getSelectionColumns = originalColumns;
