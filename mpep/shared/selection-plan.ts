@@ -161,7 +161,77 @@ function findMarkedAbove(
 	return undefined;
 }
 
-function planTable(lines: readonly string[], rows: readonly RowRef[], selection: SelectionBounds): SelectionPlan | null {
+/** One selected visual row of a table plus the native column range the pointer earned on it. */
+interface SelectedTableRow {
+	row: RowRef;
+	native: { start: number; end: number };
+}
+
+/**
+ * Whether `native` contains the whole visible content of `cell` on one visual row.
+ * Cell boxes are sized from the column width, so they include trailing padding; a
+ * pointer that stops on the last real character leaves that padding unselected.
+ * Trimming both slices keeps a padding-only gap from defeating the full-payload copy.
+ */
+function cellContentCovered(
+	line: string,
+	native: { start: number; end: number },
+	origin: number,
+	cell: CellBox,
+): boolean {
+	const boxStart = origin + cell.start;
+	const boxEnd = origin + cell.end;
+	if (native.start > boxStart) return false;
+	const clipEnd = Math.min(native.end, boxEnd);
+	const fragment = clipEnd > boxStart ? plainCell(sliceByColumn(line, boxStart, clipEnd - boxStart, true)) : "";
+	const whole = plainCell(sliceByColumn(line, boxStart, boxEnd - boxStart, true));
+	return fragment === whole;
+}
+
+/** The visible characters of one cell that `native` actually covers on a visual row. */
+function cellFragment(
+	line: string,
+	native: { start: number; end: number },
+	origin: number,
+	cell: CellBox,
+): string {
+	const start = Math.max(native.start, origin + cell.start);
+	const end = Math.min(native.end, origin + cell.end);
+	if (end <= start) return "";
+	return plainCell(sliceByColumn(line, start, end - start, true));
+}
+
+/**
+ * Completeness of one logical table row for a drag: true only when no part of the row
+ * sits outside the selected visual rows. The renderer emits a logical row's visual rows
+ * consecutively, so the check stays local: the entry count must match the selected span
+ * (a cheap defensive contiguity guard), and neither neighbour may carry the same table id
+ * and logical row. That keeps a partial drag on a very tall wrapped cell O(1) instead of
+ * walking the whole cell.
+ */
+function logicalRowComplete(
+	lines: readonly string[],
+	tableId: number,
+	logicalRow: number,
+	firstSelected: number,
+	lastSelected: number,
+	entryCount: number,
+): boolean {
+	if (entryCount !== lastSelected - firstSelected + 1) return false;
+	const sameLogicalRow = (row: number): boolean => {
+		if (row < 0 || row >= lines.length) return false;
+		const marker = parseSelectionMarkers(lines[row] ?? "").table;
+		return !!marker && marker.id === tableId && marker.logicalRow === logicalRow;
+	};
+	return !sameLogicalRow(firstSelected - 1) && !sameLogicalRow(lastSelected + 1);
+}
+
+function planTable(
+	lines: readonly string[],
+	rows: readonly RowRef[],
+	selection: SelectionBounds,
+	columns: ColumnFn,
+): SelectionPlan | null {
 	let tableId: number | undefined;
 	for (const row of rows) {
 		if (isBlankLine(row.line)) continue;
@@ -187,11 +257,12 @@ function planTable(lines: readonly string[], rows: readonly RowRef[], selection:
 		selection.start.row,
 		(parsed) => parsed.table?.id === tableId && parsed.tableRows !== undefined,
 	)?.tableRows;
-	const highlight = new Map<number, HighlightAction>();
-	const copied: string[] = [];
-	const seenRows = new Set<number>();
 	const firstCol = cols[0] ?? 0;
 	const lastCol = cols[cols.length - 1] ?? firstCol;
+
+	const highlight = new Map<number, HighlightAction>();
+	const groups: Array<{ logicalRow: number; entries: SelectedTableRow[]; covered: boolean }> = [];
+	const groupByLogical = new Map<number, (typeof groups)[number]>();
 
 	for (const row of rows) {
 		const marker = row.parsed.table;
@@ -205,24 +276,58 @@ function planTable(lines: readonly string[], rows: readonly RowRef[], selection:
 			highlight.set(row.row, { kind: "none" });
 			continue;
 		}
-		highlight.set(row.row, {
-			kind: "span",
-			start: row.parsed.origin + first.start,
-			end: row.parsed.origin + last.end,
-		});
-		if (seenRows.has(marker.logicalRow)) continue;
-		seenRows.add(marker.logicalRow);
-		const source = payload?.[marker.logicalRow];
-		if (source) {
+		// Highlight and copy both stop where the pointer stopped: the native per-row
+		// range is clipped to the first..last selected cell.
+		const native = columns(row.line, row.row, selection);
+		const blockStart = row.parsed.origin + first.start;
+		const blockEnd = row.parsed.origin + last.end;
+		const clipStart = Math.max(native.start, blockStart);
+		const clipEnd = Math.min(native.end, blockEnd);
+		highlight.set(row.row, clipEnd > clipStart ? { kind: "span", start: clipStart, end: clipEnd } : { kind: "none" });
+
+		let covered = true;
+		for (const index of cols) {
+			const cell = marker.cells[index];
+			if (!cell || !cellContentCovered(row.line, native, row.parsed.origin, cell)) covered = false;
+		}
+
+		let group = groupByLogical.get(marker.logicalRow);
+		if (!group) {
+			group = { logicalRow: marker.logicalRow, entries: [], covered: true };
+			groupByLogical.set(marker.logicalRow, group);
+			groups.push(group);
+		}
+		group.entries.push({ row, native });
+		group.covered = group.covered && covered;
+	}
+
+	const copied: string[] = [];
+	for (const group of groups) {
+		// A logical row is complete only when every one of its visual rows is inside the
+		// drag. logicalRowComplete only inspects the neighbouring rows, so a partially
+		// covered wrapped cell cannot borrow text from rows outside the pointer.
+		const firstRow = group.entries[0]?.row.row ?? 0;
+		const lastRow = group.entries[group.entries.length - 1]?.row.row ?? firstRow;
+		const complete =
+			group.covered && logicalRowComplete(lines, tableId, group.logicalRow, firstRow, lastRow, group.entries.length);
+		const source = payload?.[group.logicalRow];
+		// The logical payload holds the original cell text (real spacing, unwrapped
+		// content). It may only stand in once every visual row and every selected cell
+		// is covered, so it can never smuggle in text the pointer did not cross.
+		if (complete && source) {
 			copied.push(cols.map((index) => plainCell(source[index] ?? "")).join("\t"));
 			continue;
 		}
-		const visual = cols.map((index) => {
-			const cell = marker.cells[index];
-			if (!cell) return "";
-			return plainCell(sliceByColumn(row.line, row.parsed.origin + cell.start, cell.end - cell.start, true));
-		});
-		copied.push(visual.join("\t"));
+		// Otherwise copy exactly the visible cells the pointer covered. Partial wrap
+		// rows stay separate: no dedupe, and no text from rows outside the drag.
+		for (const entry of group.entries) {
+			const marker = entry.row.parsed.table;
+			const fields = cols.map((index) => {
+				const cell = marker?.cells[index];
+				return cell ? cellFragment(entry.row.line, entry.native, entry.row.parsed.origin, cell) : "";
+			});
+			copied.push(fields.join("\t"));
+		}
 	}
 
 	// A drag that only touched rules has no cell to snap to; keep the glyphs the user selected.
@@ -497,7 +602,7 @@ export function planSelection(
 	}
 	if (!sawMarker) return null;
 	return (
-		planTable(lines, rows, selection) ??
+		planTable(lines, rows, selection, columns) ??
 		planBlocks(lines, rows, selection, columns) ??
 		planSingleFrameRow(lines, selection, columns)
 	);
