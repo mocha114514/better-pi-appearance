@@ -68,7 +68,7 @@ Token 用量、费用、每日汇总和模型价格编辑。
 - 支持鼠标自由选中文本的情况下行文本的剪切操作（Ctrl+X）。
 - Ctrl+- / Ctrl+_进行撤销操作，Windows端额外支持Ctrl+Z。
 
-注：TPS插件源自于[Pi](https://github.com/earendil-works/pi)官方仓库实现。
+注：TPS插件源自于[Pi](https://github.com/earendil-works/pi)官方仓库实现；子代理插件的部分设计参考自[omp](https://github.com/can1357/oh-my-pi)
 
 ### 安装与更新
 

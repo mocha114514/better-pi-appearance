@@ -68,7 +68,7 @@ Disabling the plugin through `/m-mng` uninstalls it: the theme file is removed a
 - With mouse-selected text, line cutting (Ctrl+X) is supported.
 - Ctrl+- / Ctrl+_ for undo; Windows additionally supports Ctrl+Z.
 
-Note: the TPS plugin comes from the official [Pi](https://github.com/earendil-works/pi) repository implementation.
+Note: the TPS plugin comes from the official [Pi](https://github.com/earendil-works/pi) repository implementation; parts of the subagent plugin design are referenced from [omp](https://github.com/can1357/oh-my-pi).
 
 ### Install and Update
 
