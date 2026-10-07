@@ -129,13 +129,14 @@ export function discoverAgents(): AgentConfig[] {
  * Built-in preset agents, seeded into the agents directory on load. Any preset
  * whose file is missing gets (re)written; existing files are never touched, so
  * user edits survive. Design borrows from oh-my-pi's built-in agents:
- * trigger-style descriptions, XML-sectioned bodies, MUST/NEVER wording, and a
- * structured output contract per agent.
+ * XML-sectioned bodies, MUST/NEVER behavior wording, and a structured output
+ * contract per agent. Descriptions stay objective (what the agent is for),
+ * without coercive "MUST use" framing that would cause over-eager delegation.
  */
 const PRESET_AGENTS: Record<string, string> = {
 	"scout.md": `---
 name: scout
-description: MUST be used for exploratory codebase research, rapid code analysis, and broad pattern searches. Fast read-only scout returning compressed context for handoff.
+description: Exploratory codebase research, rapid code analysis, and broad pattern searches. Fast read-only scout returning compressed context for handoff.
 tools: read, grep, find, ls
 thinking: medium
 output:
@@ -192,7 +193,7 @@ Keep going until the task is complete, then call submit_result exactly once.
 
 	"reviewer.md": `---
 name: reviewer
-description: MUST be used for code review of a patch or diff before merge. Quality and security analysis with evidence-backed, priority-ranked findings.
+description: Code review of a patch or diff before merge. Quality and security analysis with evidence-backed, priority-ranked findings.
 tools: read, grep, find, ls, bash
 thinking: high
 output:
@@ -270,7 +271,7 @@ Every finding MUST be patch-anchored and evidence-backed. A clean patch is a val
 
 	"worker.md": `---
 name: worker
-description: MUST be used for well-scoped implementation tasks delegated by the main agent. General-purpose executor with full tool access.
+description: Well-scoped implementation tasks delegated by the main agent. General-purpose executor with full tool access.
 thinking: medium
 output:
   properties:
