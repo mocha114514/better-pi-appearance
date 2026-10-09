@@ -60,6 +60,62 @@ Ships the bundled `mpep-blue` theme. On first load it installs the theme into `~
 
 Disabling the plugin through `/m-mng` uninstalls it: the theme file is removed and the previously selected theme is restored (falls back to Pi's default `dark`).
 
+### Responses WebSocket
+
+Optional transport for the Responses API. Pi still owns the model list, auth, request building, and response parsing. This extension does not modify Pi core and does not patch global `fetch`.
+
+It is enabled by default in `/m-mng`, but it does nothing until a model opts in. Set `"ws": true` in Pi's `models.json` (`~/.pi/agent/models.json`, or under `PI_CODING_AGENT_DIR` when that is set). Examples below use `//` comments; trailing commas are allowed.
+
+Custom model entry:
+
+```jsonc
+{
+  "providers": {
+    "example-provider": {
+      "baseUrl": "https://example.invalid/v1",
+      "apiKey": "YOUR_API_KEY",
+      "api": "openai-responses",
+      "models": [
+        {
+          "id": "example-model",
+          // Other model fields stay Pi's. Only ws is read here.
+          "api": "openai-responses",
+          "ws": true,
+        },
+      ],
+    },
+  },
+}
+```
+
+For a model already supplied by a built-in provider, use `modelOverrides` rather than duplicating it in `models[]`. Replace the placeholder provider and model ids below with the existing ones; the model must already resolve to `openai-responses`:
+
+```jsonc
+{
+  "providers": {
+    "example-provider": {
+      "modelOverrides": {
+        "builtin-model": {
+          "ws": true,
+        },
+      },
+    },
+  },
+}
+```
+
+- WebSocket is used only when the resolved model `api` is `openai-responses` and the effective `ws` value is `true`. `ws: false`, or no `ws` field, keeps Pi's original transport. Any other API is left untouched.
+- For the same model id, an explicit `modelOverrides` `ws` wins over `models[]`, including `ws: false`.
+- Edits to `models.json`, and `/m-mng enable responses-ws` or `/m-mng disable responses-ws`, apply only after a restart or `/reload`.
+- Each request still sends the full context Pi built. There is no automatic `previous_response_id` optimization.
+- WebSocket events are bridged to a local SSE stream for Pi's original parser. A network WebSocket error is never retried as a network HTTP/SSE request.
+- An idle socket is reused only when provider, session, WebSocket URL, final handshake headers, and proxy all match. Concurrent requests use separate sockets. `cacheRetention: "none"` is not reused.
+- Parked sockets close after 5 minutes idle or 55 minutes of age. Shutdown and `/reload` close sockets this extension owns.
+- If another extension already registered that provider, this one refuses it, leaves that registration unchanged, and notifies you.
+- `onResponse` receives synthetic local-SSE metadata (`200`, `X-MPEP-Transport: websocket`). That is not the HTTP create response and not the WebSocket upgrade response.
+
+Verified with local loopback synthetic tests against the Node.js installation of Pi 0.85.1, including native-provider integration, cancellation, timeouts, connection isolation, an HTTP CONNECT proxy, and production-only package copies loaded through Pi's actual extension loader (with no local Pi SDK and with an extension-local decoy helper). The extension resolves Pi's public proxy helper from the host installation; hosts without that helper report a compatibility error rather than bypassing proxy settings. Standalone executable distributions and real official/intermediary APIs have not been verified. The server must support Responses WebSocket.
+
 ### Keyboard Shortcuts
 
 - Ctrl+C no longer clears the input box text.
@@ -87,12 +143,12 @@ Then manually delete `~/.pi/agent/mpep-cache/` if you want a full cleanup.
 
 ### Commands
 
-| Command              | Purpose                                        |
-| -------------------- | ---------------------------------------------- |
-| `/m-mng`             | Enable or disable extensions you like/dislike  |
-| `/m-mng list`        | List plugin states                             |
-| `/m-lgg`             | Chinese/English selection                      |
-| `/m-usg` / `/-usg n` | View usage and cost statistics                 |
+| Command              | Purpose                                                |
+| -------------------- | ------------------------------------------------------ |
+| `/m-mng`             | Enable or disable extensions, including `responses-ws` |
+| `/m-mng list`        | List plugin states                                     |
+| `/m-lgg`             | Chinese/English selection                              |
+| `/m-usg` / `/-usg n` | View usage and cost statistics                         |
 
 ### Data Location
 

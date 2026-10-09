@@ -110,5 +110,12 @@
     "path": "./subagent/index.ts",
     "desc": "以常驻 pi RPC 子进程跑隔离子代理，keep/drop 生命周期管理与崩溃残留恢复",
     "enabled": true
+  },
+  {
+    "id": "responses-ws",
+    "name": "Responses WebSocket 传输",
+    "path": "./responses-ws/index.ts",
+    "desc": "仅对 openai-responses 且 ws: true 的模型启用 WS，沿用 Pi 的请求构造与响应解析",
+    "enabled": true
   }
 ]

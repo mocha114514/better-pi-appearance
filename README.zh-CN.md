@@ -60,6 +60,62 @@ Token 用量、费用、每日汇总和模型价格编辑。
 
 通过 `/m-mng` 禁用该插件即等于卸载：删除主题文件，并还原安装前使用的主题（无记录时回退到 pi 默认的 `dark`）。
 
+### Responses WebSocket 传输
+
+可选的 Responses API 传输。模型、鉴权、请求构造和响应解析仍由 Pi 负责。本扩展不修改 Pi 核心，也不替换全局 `fetch`。
+
+它在 `/m-mng` 中默认启用，但没有模型显式打开时不会做任何事。在 Pi 的 `models.json`（`~/.pi/agent/models.json`；设置了 `PI_CODING_AGENT_DIR` 时跟随该目录）里写 `"ws": true`。下面的示例只用 `//` 注释；允许行尾逗号。
+
+自定义模型：
+
+```jsonc
+{
+  "providers": {
+    "example-provider": {
+      "baseUrl": "https://example.invalid/v1",
+      "apiKey": "YOUR_API_KEY",
+      "api": "openai-responses",
+      "models": [
+        {
+          "id": "example-model",
+          // Other model fields stay Pi's. Only ws is read here.
+          "api": "openai-responses",
+          "ws": true,
+        },
+      ],
+    },
+  },
+}
+```
+
+对于内置 provider 已经提供的模型，用 `modelOverrides` 标记，不必在 `models[]` 中重复定义。下面的 provider 和模型 id 是占位值，需要替换成已有名称；该模型解析后的 API 必须已经是 `openai-responses`：
+
+```jsonc
+{
+  "providers": {
+    "example-provider": {
+      "modelOverrides": {
+        "builtin-model": {
+          "ws": true,
+        },
+      },
+    },
+  },
+}
+```
+
+- 只有解析后的模型 `api` 为 `openai-responses`，且最终生效的 `ws` 为 `true` 时才使用 WebSocket。`ws: false` 或没有 `ws` 字段时，保持 Pi 原来的传输。其他 API 即使写了 `ws` 也不会被改动。
+- 同一模型 id 上，`modelOverrides` 里显式的 `ws` 优先于 `models[]`，包括 `ws: false`。
+- 修改 `models.json`，或执行 `/m-mng enable responses-ws` 与 `/m-mng disable responses-ws` 之后，需要重启或 `/reload` 才会生效。
+- 每次请求仍发送 Pi 构造的完整上下文，不会自动改成 `previous_response_id` 优化。
+- WebSocket 事件会桥接成本地 SSE，交给 Pi 原来的解析器。网络层的 WebSocket 错误不会再退回网络 HTTP/SSE。
+- 空闲连接只在 provider、会话、WebSocket URL、最终握手头和代理都相同时复用。并发请求各用各的连接。`cacheRetention: "none"` 不复用。
+- 闲置 5 分钟，或连接年龄达到 55 分钟，会关闭可复用连接。会话关闭和 `/reload` 会关闭本扩展持有的连接。
+- 若其他扩展已经注册了该 provider，本扩展会拒绝接管、保持原注册不变，并发出通知。
+- `onResponse` 拿到的是本地合成 SSE 的元数据（状态 `200`，头 `X-MPEP-Transport: websocket`），不是真实的 HTTP create 响应，也不是 WebSocket 升级响应。
+
+已针对 Node.js 安装版 Pi 0.85.1 完成本地 loopback 合成验证，覆盖原生 provider 集成、取消、超时、连接隔离和 HTTP CONNECT 代理；仅包含生产依赖的插件副本也已通过 Pi 的真实扩展加载器验证，包括没有本地 Pi SDK，以及存在本地伪代理模块的场景。扩展从宿主安装目录解析 Pi 的公开代理辅助模块；宿主没有该模块时会明确报兼容性错误，不会绕过代理设置。独立可执行文件发行版以及真实官方／中转 API 尚未验证。服务端必须支持 Responses WebSocket。
+
 ### 快捷键优化
 
 - 取消了Ctrl+C清空输入框文本的行为。
@@ -87,12 +143,12 @@ pi remove git:github.com/mocha114514/better-pi-appearance
 
 ### 常用指令
 
-| 指令                 | 用途                          |
-| -------------------- | ----------------------------- |
-| `/m-mng`             | 启用和禁用你喜欢/不喜欢的扩展 |
-| `/m-mng list`        | 查看插件状态                  |
-| `/m-lgg`             | 中文/英文选择                 |
-| `/m-usg` / `/-usg n` | 查看用量与费用统计            |
+| 指令                 | 用途                                |
+| -------------------- | ----------------------------------- |
+| `/m-mng`             | 启用和禁用扩展，包括 `responses-ws` |
+| `/m-mng list`        | 查看插件状态                        |
+| `/m-lgg`             | 中文/英文选择                       |
+| `/m-usg` / `/-usg n` | 查看用量与费用统计                  |
 
 ### 数据位置
 
