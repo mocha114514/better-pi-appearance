@@ -1,4 +1,6 @@
 import { InteractiveMode, type SessionEntry } from "@earendil-works/pi-coding-agent";
+import type { Container } from "@earendil-works/pi-tui";
+import { installRetainedRegion } from "./retained_region.ts";
 
 /** Minimal shape needed to find the cut: session entries already carry this. */
 export interface PlacementEntry {
@@ -39,6 +41,9 @@ export function placeCompactionAtCut<T extends PlacementEntry>(
 
 interface RenderHost {
 	sessionManager?: { getBranch?: () => readonly PlacementEntry[] };
+	// Accessed by the retained-region install, which scans the painted children.
+	chatContainer?: Container;
+	ui?: { requestRender?: () => void };
 	renderSessionEntries(entries: SessionEntry[], options?: unknown): void;
 }
 
@@ -69,6 +74,11 @@ export function installCompactionPlacement(): () => void {
 	const installed = function (this: RenderHost, entries: SessionEntry[], options?: unknown): void {
 		const branch = this.sessionManager?.getBranch?.() ?? [];
 		original.call(this, placeCompactionAtCut(entries, branch) as SessionEntry[], options);
+		// Live compaction_end renders the kept tail here, then appends the banner
+		// synchronously afterwards. A microtask runs after that append and before
+		// Pi's nextTick paint, so the region sees the banner on both paths.
+		const host = this;
+		queueMicrotask(() => installRetainedRegion(host));
 	};
 	proto.renderSessionEntries = installed;
 	const dispose = () => {

@@ -40,10 +40,11 @@ function foldAnchor(process: ProcessFoldState, last: MessageState, finalPartInde
 
 /**
  * Seal every pending process at a run or user boundary, whether it succeeded or not.
- * `retained` marks the disclosure that holds the messages Pi kept verbatim after a
- * compaction, so its header can carry a tag instead of looking like ordinary history.
+ * The compaction-kept tail is no longer tagged here; the whole region in front of
+ * the compaction banner folds behind the "Retained content" header instead
+ * (see retained_region.ts).
  */
-export function completeProcessFolds(options?: { retained?: boolean }): void {
+export function completeProcessFolds(): void {
 	separateProcessFold();
 	for (const process of pending) {
 		if (process.fold) continue;
@@ -55,7 +56,6 @@ export function completeProcessFolds(options?: { retained?: boolean }): void {
 		// Direct answers with no preceding work do not need an empty disclosure.
 		if (!anchor) continue;
 		process.fold = { anchorMessageId: anchor.id, finalMessageId: last.id, finalPartIndex };
-		if (options?.retained) process.fold.retained = true;
 		process.expanded = false;
 		for (const message of process.messages) message.refresh?.();
 	}

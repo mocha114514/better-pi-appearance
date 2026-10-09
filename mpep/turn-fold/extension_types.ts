@@ -99,8 +99,6 @@ export interface ProcessFoldState {
 		anchorMessageId: number;
 		finalMessageId: number;
 		finalPartIndex: number;
-		/** Set when the disclosure holds the tail Pi kept verbatim after a compaction. */
-		retained?: boolean;
 	};
 }
 

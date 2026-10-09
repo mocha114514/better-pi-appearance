@@ -386,9 +386,9 @@ export function syncFromSessionHistory(
 		const entry = entries[index];
 		if (entry.type === "compaction") {
 			sealActiveGroup();
-			// The process sealed by a compaction boundary is the tail Pi kept verbatim for
-			// the model context, so its disclosure gets the "kept" tag.
-			completeProcessFolds({ retained: true });
+			// The compaction boundary seals the kept tail like any other boundary; the
+			// retained region header (retained_region.ts) now marks the whole tail.
+			completeProcessFolds();
 		} else if (entry.type === "branch_summary") {
 			sealActiveGroup();
 			completeProcessFolds();

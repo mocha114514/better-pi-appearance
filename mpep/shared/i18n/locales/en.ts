@@ -130,6 +130,7 @@ export const en = {
   "activity.compacted": "**Compacted from {count} tokens**\n\n",
   "activity.cookingProcess": "Cooking process",
   "activity.retainedTail": "kept by compaction",
+  "activity.retainedContent": "Retained content",
   "export.description": "Export this session as interactive HTML (MPEP folds, compacted history included)",
   "export.pageTitle": "{name} · MPEP export",
   "export.toc": "conversation",

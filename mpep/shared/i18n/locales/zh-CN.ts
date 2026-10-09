@@ -131,6 +131,7 @@ export const zhCN = {
   "activity.compacted": "**从 {count} tokens 压缩**\n\n",
   "activity.cookingProcess": "Cooking process",
   "activity.retainedTail": "压缩保留的原文",
+  "activity.retainedContent": "Retained content",
   "export.description": "导出当前会话为交互式 HTML（折叠风格，含压缩前历史）",
   "export.pageTitle": "{name} · MPEP 导出",
   "export.toc": "对话目录",
