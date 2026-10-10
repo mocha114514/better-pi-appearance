@@ -12,6 +12,7 @@ const builtinIds = [
 	"terminal-interaction",
 	"turn-navigator",
 	"cooking-timer",
+	"list",
 	"statusline",
 	"tps",
 	"turn-notify",

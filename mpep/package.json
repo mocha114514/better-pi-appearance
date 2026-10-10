@@ -24,6 +24,7 @@
       "./turn-navigator/index.ts",
       "./path-links/index.ts",
       "./cooking-timer.ts",
+      "./list/index.ts",
       "./statusline.ts",
       "./tps.ts",
       "./turn-notify/index.ts",

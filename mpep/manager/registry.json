@@ -42,6 +42,13 @@
     "enabled": true
   },
   {
+    "id": "list",
+    "name": "AI 依赖清单",
+    "path": "./list/index.ts",
+    "desc": "带说明与依赖校验的会话清单、输入框右侧悬浮窗，以及压缩后的全文恢复",
+    "enabled": true
+  },
+  {
     "id": "statusline",
     "name": "高对比彩色状态栏",
     "path": "./statusline.ts",

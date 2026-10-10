@@ -32,6 +32,18 @@ Double-click to expand:
 
 Replaces the full-width solid background block of user messages with a clean, modern colored rounded border, eliminating visual harshness and keeping the background transparent. Can be toggled independently via `/m-mng`.
 
+### AI Dependency Checklist
+
+Provides `list_write` and `list_read` tools. Items retain their creation order, stable IDs, full descriptions, and prerequisites explicitly specified by the AI through `dependsOn`. An item can only be completed after all prerequisites are done. Duplicate IDs, missing prerequisites, and dependency cycles are rejected.
+
+In Pi **full screen mode**, click **list** on the right side of the editor's top border to open or close the popup, or use `/m-list`. Pi 0.85.1's regular mode has no component-level mouse dispatch, so the button is hidden there while AI checklist tools remain available. The panel prefers 64 character columns and grows upward until it reaches the terminal top, then scrolls internally without moving the transcript or taking input focus. Completed titles use strikethrough; their descriptions and dependencies remain readable.
+
+State lives in Pi's session log, not a chat summary or project file. Browsing earlier transcript positions within the same session does not roll back task progress. A completed checklist remains until the next one is created; unfinished checklists cannot be overwritten.
+
+After every successful context compaction, the extension appends one **full checklist snapshot** to the new context, including completed items, descriptions, and dependencies. The message is visible to the model but hidden in the chat UI and never starts an extra reply. Later tool results supersede the point-in-time snapshot. Full text consumes context tokens and is never silently summarized or truncated.
+
+`list_write` supports `create`, `append`, `update`, and `complete`; `list_read` always returns the entire checklist, including completed work. Dependency gating is enforced by the extension, while the AI remains responsible for verifying that the actual work is finished. Toggle the plugin independently through `/m-mng`.
+
 ### Turn Navigator
 
 Adds a navigator on the right side to quickly review each round's user prompt and jump to it with a click.
