@@ -107,6 +107,7 @@ Token 用量、费用、每日汇总和模型价格编辑。
 - 只有解析后的模型 `api` 为 `openai-responses`，且最终生效的 `ws` 为 `true` 时才使用 WebSocket。`ws: false` 或没有 `ws` 字段时，保持 Pi 原来的传输。其他 API 即使写了 `ws` 也不会被改动。
 - 同一模型 id 上，`modelOverrides` 里显式的 `ws` 优先于 `models[]`，包括 `ws: false`。
 - 修改 `models.json`，或执行 `/m-mng enable responses-ws` 与 `/m-mng disable responses-ws` 之后，需要重启或 `/reload` 才会生效。
+- 新启动的子代理也默认加载此插件，各自使用独立连接池，仍遵守插件总开关和模型的启用条件。已运行的子进程需要重启才能应用这个加载变更。
 - 每次请求仍发送 Pi 构造的完整上下文，不会自动改成 `previous_response_id` 优化。
 - WebSocket 事件会桥接成本地 SSE，交给 Pi 原来的解析器。网络层的 WebSocket 错误不会再退回网络 HTTP/SSE。
 - 空闲连接只在 provider、会话、WebSocket URL、最终握手头和代理都相同时复用。并发请求各用各的连接。`cacheRetention: "none"` 保留 Pi 原有的提示词缓存行为，但不再禁止 WebSocket 连接复用。

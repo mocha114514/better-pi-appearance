@@ -13,8 +13,9 @@
  *   thinking      off|minimal|low|medium|high|xhigh|max; inherits when omitted
  *   tools         allowlist of tool names (comma string or YAML array)
  *   exclude_tools denylist of tool names (mutually exclusive with `tools`)
- *   extensions    extra extension files to load (YAML array); the subagent always
- *                 runs with --no-extensions, so only what is listed here is loaded
+ *   extensions    extra extension files to load (YAML array), in addition to the
+ *                 default compact-forewarn and responses-ws siblings. Discovery
+ *                 stays disabled (--no-extensions); each plugin keeps its own guards.
  */
 
 import * as fs from "node:fs";

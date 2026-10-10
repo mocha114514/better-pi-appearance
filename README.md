@@ -107,6 +107,7 @@ For a model already supplied by a built-in provider, use `modelOverrides` rather
 - WebSocket is used only when the resolved model `api` is `openai-responses` and the effective `ws` value is `true`. `ws: false`, or no `ws` field, keeps Pi's original transport. Any other API is left untouched.
 - For the same model id, an explicit `modelOverrides` `ws` wins over `models[]`, including `ws: false`.
 - Edits to `models.json`, and `/m-mng enable responses-ws` or `/m-mng disable responses-ws`, apply only after a restart or `/reload`.
+- Newly started subagents also load this plugin by default, with their own connection pools and the same plugin-enable/model opt-in checks. Existing child processes must be restarted to pick up the loading change.
 - Each request still sends the full context Pi built. There is no automatic `previous_response_id` optimization.
 - WebSocket events are bridged to a local SSE stream for Pi's original parser. A network WebSocket error is never retried as a network HTTP/SSE request.
 - An idle socket is reused only when provider, session, WebSocket URL, final handshake headers, and proxy all match. Concurrent requests use separate sockets. `cacheRetention: "none"` keeps Pi's prompt-cache behavior but does not disable WebSocket reuse.

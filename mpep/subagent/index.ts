@@ -67,6 +67,8 @@ export default function (pi: ExtensionAPI): void {
 	 * isPluginEnabled guard still applies, so disabling it in the plugin
 	 * manager disables it for subagents too. */
 	const compactForewarnPath = fileURLToPath(new URL("../compact-forewarn/index.ts", import.meta.url));
+	/** Each child owns its WS pool; the sibling's manager/model guards still apply. */
+	const responsesWsPath = fileURLToPath(new URL("../responses-ws/index.ts", import.meta.url));
 
 	let ctx: ExtensionContext | undefined;
 	let pool: InstancePool | undefined;
@@ -120,7 +122,10 @@ export default function (pi: ExtensionAPI): void {
 			args.push("--exclude-tools", agent.excludeTools.filter((t) => t !== "submit_result").join(","));
 		}
 		// Default sibling extensions + the agent's own declared ones (deduped).
-		const extensionPaths = new Set<string>([compactForewarnPath]);
+		const extensionPaths = new Set<string>([
+			compactForewarnPath,
+			responsesWsPath,
+		]);
 		for (const extension of agent.extensions) {
 			extensionPaths.add(path.resolve(cwd, extension));
 		}
