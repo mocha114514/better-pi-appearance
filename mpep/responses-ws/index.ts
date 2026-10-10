@@ -117,9 +117,9 @@ export default function responsesWsExtension(pi: ExtensionAPI): void {
                     ...(onResponse ? { onResponse } : {}),
                     fetch: createWsFetch(transport, {
                         provider: model.provider,
-                        sessionId: options?.cacheRetention === "none"
-                            ? undefined
-                            : options?.sessionId ?? ctx.sessionManager.getSessionId(),
+                        // Prompt-cache policy does not govern transport reuse.
+                        // Pi still receives the original cacheRetention option.
+                        sessionId: options?.sessionId ?? ctx.sessionManager.getSessionId(),
                         env: options?.env,
                         signal: transportSignal,
                         timeoutMs: options?.timeoutMs,

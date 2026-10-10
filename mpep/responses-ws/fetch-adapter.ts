@@ -51,11 +51,16 @@ export function createWsFetch(
 		let started = false;
 		let finished = false;
 		let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
-		const finish = (reusable: boolean, error?: unknown) => {
+		const finish = (
+			reusable: boolean,
+			error?: unknown,
+			recoverConnection = false,
+		) => {
 			if (finished) return;
 			finished = true;
 			stop?.removeEventListener("abort", onCallerAbort);
-			lease.release(reusable && !stop?.aborted);
+			lease.interrupted.removeEventListener("abort", onDisconnected);
+			lease.release(reusable && !stop?.aborted, recoverConnection && !stop?.aborted);
 			if (error !== undefined && controller) {
 				const message = error instanceof Error
 					? error.message
@@ -68,12 +73,28 @@ export function createWsFetch(
 			}
 		};
 		const onCallerAbort = () => finish(false, abortedError(stop));
+		const onDisconnected = () => {
+			if (stop?.aborted) {
+				onCallerAbort();
+				return;
+			}
+			// A started iterator may already contain a terminal event queued
+			// before the close. Preserve that ordering for Pi's original parser;
+			// otherwise its error/reconnecting/close event fails the response.
+			if (started) return;
+			// An unread body must never dispatch after a reconnect.
+			finish(false, new ResponsesWsError(
+				"Responses WebSocket closed before a terminal response (connection interrupted).",
+			), true);
+		};
 
 		const body = new ReadableStream<Uint8Array>({
 			start(streamController) {
 				controller = streamController;
 				stop?.addEventListener("abort", onCallerAbort, { once: true });
+				lease.interrupted.addEventListener("abort", onDisconnected, { once: true });
 				if (stop?.aborted) onCallerAbort();
+				else if (lease.interrupted.aborted) onDisconnected();
 			},
 			async pull(streamController) {
 				if (finished) return;
@@ -94,11 +115,11 @@ export function createWsFetch(
 					// terminal events, stay intact for Pi's original SSE parser.
 					streamController.enqueue(encoder.encode(sseFrame(message)));
 					if (TERMINAL_EVENTS.has(message.type)) {
-						finish(true);
+						finish(true, undefined, lease.interrupted.aborted);
 						streamController.close();
 					}
 				} catch (error) {
-					finish(false, error);
+					finish(false, error, lease.interrupted.aborted);
 				}
 			},
 			cancel() {
@@ -191,7 +212,7 @@ async function nextResponseMessage(
 			);
 		}
 		if (event.type === "reconnecting" || event.type === "reconnected") {
-			throw new ResponsesWsError("Responses WebSocket reconnect is disabled.");
+			throw new ResponsesWsError("Responses WebSocket interrupted before a terminal response.");
 		}
 		if (event.type !== "message") continue;
 		if (event.message.type === "error") {

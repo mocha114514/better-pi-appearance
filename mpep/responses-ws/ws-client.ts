@@ -18,6 +18,9 @@ import { getPackageDir } from "@earendil-works/pi-coding-agent";
 import { HttpsProxyAgent } from "https-proxy-agent";
 import { resolve as resolveModule } from "import-meta-resolve";
 import OpenAI from "openai";
+import type WebSocket from "ws";
+
+import { WsHeartbeat, type HeartbeatOptions } from "./heartbeat.ts";
 import type { ResponsesStreamMessage } from "openai/resources/responses/internal-base";
 import {
 	ResponsesWS,
@@ -30,10 +33,14 @@ export type { ResponsesStreamMessage };
 export const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 600_000;
 
 /** Handshake budget. Stream idleness after open uses timeoutMs instead. */
-export const DEFAULT_CONNECT_TIMEOUT_MS = 15_000;
+export const DEFAULT_CONNECT_TIMEOUT_MS = 60_000;
 
-/** Parked sockets are closed after this long. The timer is unref'd. */
-export const DEFAULT_IDLE_TIMEOUT_MS = 5 * 60_000;
+/** Native SDK doubling and jitter are preserved; these budgets were agreed explicitly. */
+export const DEFAULT_RECONNECT_OPTIONS = Object.freeze({
+	maxRetries: 5,
+	initialDelay: 1875,
+	maxDelay: 30_000,
+});
 
 /**
  * Server-side Responses sockets are documented to live about 60 minutes.
@@ -76,9 +83,9 @@ export interface WsRequestContext {
 
 export interface ResponsesWsPoolOptions {
 	/**
-	 * Idle reusable sockets are closed after this many milliseconds.
-	 * `0` expires on the next timer turn. Omit for the 5 minute default.
-	 * The timer does not keep the process alive.
+	 * Optional idle eviction budget for explicitly configured callers.
+	 * Omit to retain healthy sockets until maxConnectionAgeMs instead.
+	 * `0` expires on the next timer turn. The timer is unref'd.
 	 */
 	idleTimeoutMs?: number;
 	/**
@@ -88,6 +95,10 @@ export interface ResponsesWsPoolOptions {
 	maxConnectionAgeMs?: number;
 	/** Clock used for the age check. Tests can move it without sleeping. */
 	now?: () => number;
+	/** @internal Explicit timing overrides for loopback tests, not model-config fields. */
+	heartbeat?: Partial<HeartbeatOptions>;
+	/** @internal Keeps SDK retries testable without changing its backoff algorithm. */
+	reconnect?: Partial<typeof DEFAULT_RECONNECT_OPTIONS>;
 }
 
 export interface WsLease {
@@ -97,13 +108,18 @@ export interface WsLease {
 	 * because the SDK reports the current readyState when `stream()` is called.
 	 */
 	events: AsyncIterableIterator<ResponsesStreamMessage>;
+	/** Fails this lease on physical connection loss, including an unread body. */
+	readonly interrupted: AbortSignal;
 	/** Upgrade response headers, filled once the handshake completes. */
 	readonly responseHeaders: Headers;
 	send(payload: Record<string, unknown>): void;
 	/** Scrub transport error text, including immutable nested SDK errors. */
 	redactErrorMessage(message: string): string;
-	/** Idempotent. `reusable` is ignored when the socket is no longer safe. */
-	release(reusable: boolean): void;
+	/**
+	 * Idempotent. Only a transport interruption may retain background recovery.
+	 * Cancellation, parse/hook errors and unread-body disposal keep the default false.
+	 */
+	release(reusable: boolean, recoverConnection?: boolean): void;
 }
 
 export class ResponsesWsError extends Error {
@@ -113,12 +129,7 @@ export class ResponsesWsError extends Error {
 	}
 }
 
-interface PlatformSocket {
-	readyState: number;
-	terminate?: () => void;
-	on?: (event: string, listener: (...args: never[]) => void) => void;
-	removeListener?: (event: string, listener: (...args: never[]) => void) => void;
-}
+type PlatformSocket = WebSocket;
 
 interface UpgradeResponse {
 	headers?: Record<string, string | string[] | undefined>;
@@ -132,13 +143,23 @@ interface PoolEntry {
 	responseHeaders: Headers;
 	secrets: string[];
 	openedAt: number;
-	state: "connecting" | "leased" | "idle" | "closed";
+	state: "connecting" | "leased" | "idle" | "recovering" | "closed";
 	failed: boolean;
+	recovering: boolean;
+	permanentlyClosed: boolean;
+	poisoned: boolean;
+	hasOpened: boolean;
 	generation: number;
+	physical?: PlatformSocket;
+	heartbeat?: WsHeartbeat;
+	detachPhysical?: () => void;
+	interruption?: AbortController;
+	cancelRecovery?: () => void;
 	iterator?: AsyncIterableIterator<ResponsesStreamMessage>;
 	idleTimer?: ReturnType<typeof setTimeout>;
 	onError: (error: unknown) => void;
 	onClose: () => void;
+	onReconnected: () => void;
 	onUpgrade: (response: UpgradeResponse) => void;
 	onTraffic: () => void;
 }
@@ -149,21 +170,23 @@ interface ConnectWaiter {
 }
 
 export class ResponsesWsPool {
-	private readonly idleTimeoutMs: number;
+	private readonly idleTimeoutMs: number | undefined;
 	private readonly maxConnectionAgeMs: number;
 	private readonly now: () => number;
+	private readonly heartbeatOptions: Partial<HeartbeatOptions>;
+	private readonly reconnectOptions: typeof DEFAULT_RECONNECT_OPTIONS;
 	private readonly entries = new Set<PoolEntry>();
 	private readonly idle = new Map<string, PoolEntry[]>();
 	private readonly lifetime = new AbortController();
 	private disposed = false;
 
 	constructor(options: ResponsesWsPoolOptions = {}) {
-		this.idleTimeoutMs = nonNegative(options.idleTimeoutMs, DEFAULT_IDLE_TIMEOUT_MS);
-		this.maxConnectionAgeMs = nonNegative(
-			options.maxConnectionAgeMs,
-			DEFAULT_MAX_CONNECTION_AGE_MS,
-		);
+		this.idleTimeoutMs = nonNegative(options.idleTimeoutMs);
+		this.maxConnectionAgeMs = nonNegative(options.maxConnectionAgeMs)
+			?? DEFAULT_MAX_CONNECTION_AGE_MS;
 		this.now = options.now ?? Date.now;
+		this.heartbeatOptions = { ...options.heartbeat };
+		this.reconnectOptions = { ...DEFAULT_RECONNECT_OPTIONS, ...options.reconnect };
 	}
 
 	/**
@@ -200,7 +223,7 @@ export class ResponsesWsPool {
 		if (context.sessionId) {
 			const parked = this.takeIdle(key);
 			if (parked) {
-				return this.beginLease(parked);
+				return this.beginLease(parked, context.signal);
 			}
 		}
 
@@ -219,7 +242,11 @@ export class ResponsesWsPool {
 			this.destroy(entry);
 			throw new ResponsesWsError("Responses WebSocket pool is disposed.");
 		}
-		return this.beginLease(entry);
+		if (entry.failed || entry.recovering || platformSocket(entry.socket)?.readyState !== READY_STATE_OPEN) {
+			this.destroy(entry);
+			throw new ResponsesWsError("Responses WebSocket closed before it was usable.");
+		}
+		return this.beginLease(entry, context.signal);
 	}
 
 	/** Close every owned socket, including sockets still connecting. */
@@ -242,40 +269,50 @@ export class ResponsesWsPool {
 		key: string,
 		context: WsRequestContext,
 	): PoolEntry {
-		const connectTimeoutMs = positive(
-			context.websocketConnectTimeoutMs,
-			DEFAULT_CONNECT_TIMEOUT_MS,
-		);
+		const connectTimeoutMs = positive(context.websocketConnectTimeoutMs, DEFAULT_CONNECT_TIMEOUT_MS);
 		const secrets = collectSecrets(handshakeHeaders, proxyUrl);
 		let agent: HttpsProxyAgent<string> | undefined;
 		if (proxyUrl) {
 			try {
 				agent = new HttpsProxyAgent(proxyUrl);
 			} catch {
-				throw new ResponsesWsError(
-					"Invalid HTTP proxy configuration for the Responses WebSocket.",
-				);
+				throw new ResponsesWsError("Invalid HTTP proxy configuration for the Responses WebSocket.");
 			}
 		}
 
-		const headerRecord = headersToRecord(handshakeHeaders);
-		const options = {
-			headers: headerRecord,
+		let entry: PoolEntry | undefined;
+		let initialRaw: PlatformSocket | undefined;
+		const options: ResponsesWSClientOptions = {
+			headers: headersToRecord(handshakeHeaders),
 			handshakeTimeout: connectTimeoutMs,
 			followRedirects: false,
-			reconnect: null,
+			reconnect: {
+				...this.reconnectOptions,
+				onReconnecting: () => {
+					// An initial handshake failure still belongs to its original
+					// establishment budget. Recovery never dispatches a request.
+					if (!entry || this.disposed || entry.state === "closed"
+						|| entry.state === "connecting" || !entry.hasOpened) {
+						return { abort: true };
+					}
+					this.interrupt(entry);
+				},
+			},
 			...(agent ? { agent } : {}),
-		} as ResponsesWSClientOptions;
+		};
 
 		let socket: ResponsesWS;
 		try {
-			socket = openExactSocket(wsUrl, options);
+			socket = openExactSocket(wsUrl, options, (raw) => {
+				if (entry) this.bindPhysical(entry, raw);
+				else initialRaw = raw;
+			});
 		} catch (error) {
 			destroyAgent(agent);
 			throw asConnectionError(error, secrets);
 		}
 
-		const entry: PoolEntry = {
+		const owned: PoolEntry = {
 			key,
 			sessionId: context.sessionId,
 			socket,
@@ -285,52 +322,142 @@ export class ResponsesWsPool {
 			openedAt: this.now(),
 			state: "connecting",
 			failed: false,
+			recovering: false,
+			permanentlyClosed: false,
+			poisoned: false,
+			hasOpened: false,
 			generation: 0,
 			onError: () => undefined,
 			onClose: () => undefined,
+			onReconnected: () => undefined,
 			onUpgrade: () => undefined,
 			onTraffic: () => undefined,
 		};
-		entry.onError = (error) => {
-			redactErrorObject(error, entry.secrets);
-			entry.failed = true;
-			if (entry.state === "idle") {
-				this.destroy(entry);
+		entry = owned;
+		owned.onError = (error) => {
+			redactErrorObject(error, owned.secrets);
+			owned.failed = true;
+			// A network error may precede the raw close that starts SDK recovery.
+			// Do not intentionally close that socket and cancel the retry loop.
+			if (owned.state === "idle" && owned.physical?.readyState === READY_STATE_OPEN) {
+				this.destroy(owned);
 			}
 		};
-		entry.onClose = () => {
-			entry.failed = true;
-			if (entry.state === "idle") {
-				this.destroy(entry);
-			}
+		owned.onClose = () => {
+			owned.permanentlyClosed = true;
+			owned.recovering = false;
+			owned.failed = true;
+			owned.interruption?.abort();
+			if (owned.state !== "leased") this.destroy(owned);
 		};
-		entry.onUpgrade = (response) => {
-			copyUpgradeHeaders(response?.headers, entry.responseHeaders);
-		};
-		entry.onTraffic = () => {
-			// A parked socket has no lease iterator. Any server frame means the
-			// next response.create would share a dirty connection, so drop it.
-			// Defer the close so this does not re-enter the SDK message parser.
-			if (entry.state !== "idle") {
+		owned.onReconnected = () => {
+			if (owned.state === "closed" || this.disposed) return;
+			if (owned.poisoned) {
+				this.destroy(owned);
 				return;
 			}
-			entry.failed = true;
+			owned.cancelRecovery?.();
+			owned.recovering = false;
+			owned.failed = false;
+			if (owned.state === "recovering") this.park(owned);
+		};
+		owned.onUpgrade = (response) => {
+			copyUpgradeHeaders(response?.headers, owned.responseHeaders);
+		};
+		owned.onTraffic = () => {
+			// Neither an idle nor a recovering socket owns a business response.
+			// Protocol ping/pong never enters the SDK event/raw message parser.
+			// After recovery, a paused old reader may still be draining its
+			// pre-close terminal event. Its aborted lease does not own new traffic.
+			if (owned.state !== "idle" && owned.state !== "recovering"
+				&& !owned.recovering && !owned.interruption?.signal.aborted) return;
+			owned.failed = true;
+			owned.poisoned = true;
 			queueMicrotask(() => {
-				if (entry.state === "idle") {
-					this.destroy(entry);
-				}
+				if (owned.poisoned) this.destroy(owned);
 			});
 		};
 
-		// Always attached, including while the socket sits idle. The SDK
-		// otherwise rejects an error with no listener as an unhandled rejection.
-		socket.on("error", entry.onError);
-		socket.on("close", entry.onClose);
-		socket.on("event", entry.onTraffic);
-		socket.on("raw", entry.onTraffic);
-		platformSocket(socket)?.on?.("upgrade", entry.onUpgrade as (...args: never[]) => void);
-		this.entries.add(entry);
-		return entry;
+		socket.on("error", owned.onError);
+		socket.on("close", owned.onClose);
+		socket.on("reconnected", owned.onReconnected);
+		socket.on("event", owned.onTraffic);
+		socket.on("raw", owned.onTraffic);
+		const raw = initialRaw ?? platformSocket(socket);
+		if (raw) this.bindPhysical(owned, raw);
+		this.entries.add(owned);
+		return owned;
+	}
+
+	/** Each SDK-created physical socket receives its own listeners and clock. */
+	private bindPhysical(entry: PoolEntry, raw: PlatformSocket): void {
+		entry.detachPhysical?.();
+		entry.heartbeat?.stop();
+		entry.heartbeat = undefined;
+		entry.physical = raw;
+		entry.responseHeaders = new Headers();
+		const current = () => entry.state !== "closed" && entry.physical === raw;
+		const onOpen = () => {
+			if (!current()) return;
+			entry.hasOpened = true;
+			entry.openedAt = this.now();
+			entry.heartbeat = new WsHeartbeat(raw, () => {
+				if (!current()) return;
+				this.interrupt(entry);
+				// Abnormal raw termination produces code 1006 for SDK recovery.
+				// SDK.close() would mark this intentional and prevent reconnect.
+				raw.terminate();
+			}, this.heartbeatOptions);
+		};
+		const onFault = () => {
+			if (!current() || !entry.hasOpened || entry.state === "connecting") return;
+			this.interrupt(entry);
+		};
+		const onUpgrade = (response: UpgradeResponse) => {
+			if (current()) entry.onUpgrade(response);
+		};
+		raw.on("open", onOpen);
+		raw.on("error", onFault);
+		raw.on("close", onFault);
+		raw.on("upgrade", onUpgrade);
+		entry.detachPhysical = () => {
+			raw.off("open", onOpen);
+			raw.off("error", onFault);
+			raw.off("close", onFault);
+			raw.off("upgrade", onUpgrade);
+		};
+		if (raw.readyState === READY_STATE_OPEN) onOpen();
+	}
+
+	private interrupt(entry: PoolEntry): void {
+		if (entry.state === "closed" || entry.permanentlyClosed) return;
+		entry.failed = true;
+		entry.recovering = true;
+		this.clearIdleTimer(entry);
+		this.removeFromIdle(entry);
+		entry.heartbeat?.stop();
+		entry.heartbeat = undefined;
+		if (entry.state === "idle") entry.state = "recovering";
+		// Fail the original lease, never resume its stream on a new socket.
+		entry.interruption?.abort();
+	}
+
+	private watchRecoveryCancellation(entry: PoolEntry, signal?: AbortSignal): void {
+		entry.cancelRecovery?.();
+		if (!signal) return;
+		const generation = entry.generation;
+		const onAbort = () => {
+			if (entry.generation === generation && entry.state === "recovering") {
+				this.destroy(entry);
+			}
+		};
+		const cleanup = () => {
+			signal.removeEventListener("abort", onAbort);
+			if (entry.cancelRecovery === cleanup) entry.cancelRecovery = undefined;
+		};
+		entry.cancelRecovery = cleanup;
+		signal.addEventListener("abort", onAbort, { once: true });
+		if (signal.aborted) onAbort();
 	}
 
 	private async waitUntilOpen(entry: PoolEntry, context: WsRequestContext): Promise<void> {
@@ -414,7 +541,7 @@ export class ResponsesWsPool {
 					throw new ResponsesWsError("Responses WebSocket closed before it opened.");
 				}
 				if (event.type === "reconnecting" || event.type === "reconnected") {
-					throw new ResponsesWsError("Responses WebSocket reconnect is disabled.");
+					throw new ResponsesWsError("Responses WebSocket interrupted while establishing the connection.");
 				}
 			}
 		} finally {
@@ -428,30 +555,29 @@ export class ResponsesWsPool {
 		}
 	}
 
-	private beginLease(entry: PoolEntry): WsLease {
+	private beginLease(entry: PoolEntry, signal?: AbortSignal): WsLease {
+		entry.cancelRecovery?.();
 		entry.generation += 1;
 		const generation = entry.generation;
 		entry.state = "leased";
+		const interruption = new AbortController();
+		entry.interruption = interruption;
 		const events = entry.iterator ?? entry.socket.stream();
 		entry.iterator = events;
 		let released = false;
 
 		return {
 			events,
+			interrupted: interruption.signal,
 			responseHeaders: entry.responseHeaders,
 			redactErrorMessage: (message) => redact(message, entry.secrets),
-			send: (payload) => {
-				this.sendOnLease(entry, generation, payload);
-			},
-			release: (reusable) => {
-				if (released) {
-					return;
-				}
+			send: (payload) => this.sendOnLease(entry, generation, payload),
+			release: (reusable, recoverConnection = false) => {
+				if (released) return;
 				released = true;
-				if (entry.generation !== generation || entry.state === "closed") {
-					return;
-				}
-				this.finishLease(entry, reusable);
+				if (entry.generation !== generation || entry.state === "closed") return;
+				entry.interruption = undefined;
+				this.finishLease(entry, reusable, recoverConnection, signal);
 			},
 		};
 	}
@@ -464,15 +590,35 @@ export class ResponsesWsPool {
 		if (entry.generation !== generation || entry.state !== "leased") {
 			throw new ResponsesWsError("Responses WebSocket lease is not active.");
 		}
-		if (platformSocket(entry.socket)?.readyState !== READY_STATE_OPEN) {
+		// Never enqueue a business request into the SDK's reconnect send queue.
+		if (entry.recovering || entry.interruption?.signal.aborted
+			|| platformSocket(entry.socket)?.readyState !== READY_STATE_OPEN) {
 			entry.failed = true;
 			throw new ResponsesWsError("Responses WebSocket is not open.");
 		}
 		entry.socket.send(payload as unknown as Parameters<ResponsesWS["send"]>[0]);
 	}
 
-	private finishLease(entry: PoolEntry, reusable: boolean): void {
+	private finishLease(
+		entry: PoolEntry,
+		reusable: boolean,
+		recoverConnection = false,
+		signal?: AbortSignal,
+	): void {
 		this.closeIterator(entry);
+		if (recoverConnection && !this.disposed && !signal?.aborted
+			&& !entry.permanentlyClosed && entry.sessionId) {
+			if (entry.recovering) {
+				entry.state = "recovering";
+				this.watchRecoveryCancellation(entry, signal);
+				return;
+			}
+			// Recovery can finish before the interrupted lease is consumed.
+			if (this.canReuse(entry)) {
+				this.park(entry);
+				return;
+			}
+		}
 		if (!reusable || !this.canReuse(entry)) {
 			this.destroy(entry);
 			return;
@@ -481,12 +627,8 @@ export class ResponsesWsPool {
 	}
 
 	private canReuse(entry: PoolEntry): boolean {
-		if (this.disposed || entry.failed || !entry.sessionId) {
-			return false;
-		}
-		if (this.age(entry) >= this.maxConnectionAgeMs) {
-			return false;
-		}
+		if (this.disposed || entry.failed || entry.poisoned || entry.recovering || !entry.sessionId) return false;
+		if (this.age(entry) >= this.maxConnectionAgeMs) return false;
 		return platformSocket(entry.socket)?.readyState === READY_STATE_OPEN;
 	}
 
@@ -523,8 +665,12 @@ export class ResponsesWsPool {
 		bucket.push(entry);
 		this.idle.set(entry.key, bucket);
 
-		const remainingLife = this.maxConnectionAgeMs - this.age(entry);
-		const delay = Math.min(this.idleTimeoutMs, Math.max(0, remainingLife));
+		// Idle time alone does not retire a connection by default. Keep the
+		// age deadline; an active lease has no such timer and finishes first.
+		const remainingLife = Math.max(0, this.maxConnectionAgeMs - this.age(entry));
+		const delay = this.idleTimeoutMs === undefined
+			? remainingLife
+			: Math.min(this.idleTimeoutMs, remainingLife);
 		entry.idleTimer = setTimeout(() => {
 			entry.idleTimer = undefined;
 			if (entry.state === "idle") {
@@ -557,43 +703,59 @@ export class ResponsesWsPool {
 	}
 
 	private destroy(entry: PoolEntry): void {
-		if (entry.state === "closed") {
-			return;
-		}
+		if (entry.state === "closed") return;
 		entry.state = "closed";
 		entry.failed = true;
+		entry.permanentlyClosed = true;
+		entry.cancelRecovery?.();
+		entry.heartbeat?.stop();
+		entry.heartbeat = undefined;
+		entry.detachPhysical?.();
+		entry.detachPhysical = undefined;
 		this.entries.delete(entry);
 		this.clearIdleTimer(entry);
 		this.removeFromIdle(entry);
+		entry.interruption?.abort();
+		entry.interruption = undefined;
 		this.closeIterator(entry);
 
 		const raw = platformSocket(entry.socket);
+		let rawClosed = !raw || raw.readyState === 3;
+		let sdkSettled = !entry.recovering;
 		const detach = () => {
-			raw?.removeListener?.("close", detach);
+			raw?.removeListener("close", onRawClosed);
+			entry.socket.off("close", onSdkSettled);
 			entry.socket.off("error", entry.onError);
 			entry.socket.off("close", entry.onClose);
+			entry.socket.off("reconnected", entry.onReconnected);
 			entry.socket.off("event", entry.onTraffic);
 			entry.socket.off("raw", entry.onTraffic);
-			raw?.removeListener?.(
-				"upgrade",
-				entry.onUpgrade as (...args: never[]) => void,
-			);
 		};
-		// close()/terminate() schedule a late error when a handshake is still
-		// pending. Retain the SDK error guard until the RAW socket has actually
-		// closed; a synchronous close() call is not that lifecycle boundary.
-		if (!raw || raw.readyState === 3) {
-			detach();
-		} else {
-			raw.on?.("close", detach);
-		}
+		const maybeDetach = () => {
+			if (rawClosed && sdkSettled) detach();
+		};
+		const onRawClosed = () => {
+			rawClosed = true;
+			maybeDetach();
+		};
+		const onSdkSettled = () => {
+			sdkSettled = true;
+			maybeDetach();
+		};
+		// SDK retry exhaustion may emit an error AFTER the final raw close,
+		// even when close() interrupted its last attempt. Guard both lifetimes.
+		// Native sleep cannot be cancelled, but intentional close prevents new
+		// connections and its eventual permanent close releases this guard.
+		if (!rawClosed) raw?.on("close", onRawClosed);
+		if (!sdkSettled) entry.socket.on("close", onSdkSettled);
+		maybeDetach();
 		try {
 			entry.socket.close({ code: 1000, reason: "closed" });
 		} catch {
 			// Already closing or not initialized.
 		}
 		try {
-			raw?.terminate?.();
+			raw?.terminate();
 		} catch {
 			// The platform socket may already be gone.
 		}
@@ -621,9 +783,12 @@ export class ResponsesWsPool {
  * the only public extension point, `_createSocket`, without reimplementing
  * the parser or the reconnect machine.
  */
-function openExactSocket(exactUrl: URL, options: ResponsesWSClientOptions): ResponsesWS {
+function openExactSocket(
+	exactUrl: URL,
+	options: ResponsesWSClientOptions,
+	onSocket: (socket: PlatformSocket) => void,
+): ResponsesWS {
 	const client = createInertClient();
-
 	class ExactUrlResponsesWS extends ResponsesWS {
 		protected override _createSocket(
 			_sdkUrl: URL,
@@ -631,16 +796,16 @@ function openExactSocket(exactUrl: URL, options: ResponsesWSClientOptions): Resp
 		) {
 			const forwarded: Record<string, string> = {};
 			for (const [name, value] of Object.entries(authHeaders)) {
-				// Effective credentials come from the finalized request headers.
-				// Drop anything the SDK synthesized from its own apiKey slot.
-				if (name.toLowerCase() !== "authorization") {
-					forwarded[name] = value;
-				}
+				if (name.toLowerCase() !== "authorization") forwarded[name] = value;
 			}
-			return super._createSocket(exactUrl, forwarded);
+			const adapter = super._createSocket(exactUrl, forwarded);
+			this.url = exactUrl;
+			// Bind before upgrade/open: reconnected fires too late to capture
+			// handshake metadata and must not leave old-socket heartbeat hooks.
+			onSocket(adapter.platformSocket as PlatformSocket);
+			return adapter;
 		}
 	}
-
 	const socket = new ExactUrlResponsesWS(client, options);
 	socket.url = exactUrl;
 	return socket;
@@ -919,9 +1084,9 @@ function positive(value: number | undefined, fallback: number): number {
 	return fallback;
 }
 
-function nonNegative(value: number | undefined, fallback: number): number {
+function nonNegative(value: number | undefined): number | undefined {
 	if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
 		return value;
 	}
-	return fallback;
+	return undefined;
 }
